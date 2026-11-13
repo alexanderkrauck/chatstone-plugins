@@ -1,7 +1,7 @@
 # chatstone for Claude Code and Codex
 
 Private conversation capture plus eight read-only archive/search tools. Native
-hooks wake a short-lived reader; no daemon, Python, Node or GitHub account is
+hooks wake a resumable background importer; no OS daemon, Python, Node or GitHub account is
 needed. Requires a supported native harness, POSIX sh, curl and stock OS utilities
 (including SHA-256). Linux and macOS only; Windows is not supported. The release
 workflow targets Ubuntu 24.04 for Linux; older distributions are unqualified.
@@ -45,7 +45,7 @@ The first trusted wake acquires the runner. In a separate terminal:
 Enter an invitation-only enrollment code at the **hidden prompt**, never in chat
 or arguments. The operator binds it to your tenant, device name and chosen source.
 Keep the same device name for Hermes/Claude/Codex, with separate sources. Restart
-the harness after login so its MCP process reconnects. No key is stored in harness
+the harness after login so its MCP process reconnects. Login starts existing-history import automatically; closing the terminal is safe. No key is stored in harness
 settings; both plugins start the local `chatstone mcp --source ...` proxy.
 
 ## Capture, status and privacy
@@ -58,12 +58,23 @@ Replace `codex` below with `claude_code` for Claude:
 "${XDG_DATA_HOME:-$HOME/.local/share}/chatstone/bin/chatstone" diagnose --source codex
 ```
 
-Backfill visits newest sessions first (native order inside each session).
-Ctrl-C pauses safely; the next run resumes. Live appends to completed sessions
-overtake queued history. Hooks reconcile on the next wake after a delayed flush.
-Bad records have a content-free skip reason and do not stall later records;
-`backfill --retry-skips` retries them after a reader update. `diagnose` performs
-one bounded real sync step. Offline/capacity failures keep the durable queue.
+Live session tails overtake historical queues, including partially read files.
+Hooks also fire on user-prompt submission and tool completion; workers keep
+checking for delayed transcript writes for 30 seconds after the latest hook.
+Imports retry timeouts, disconnects and server restarts automatically with
+backoff. Invalid/revoked keys, disabled ingestion and exhausted capacity stop
+with an explanation and a next step. Queued records remain safe.
+
+Default output is plain progress and a final summary; `--json` preserves the
+machine-readable form. `status` without `--source` shows both sources, last
+hook/last successful upload and skipped record **type names** with counts. New
+parsers automatically re-read old skips and enrich session metadata without
+resending unchanged messages. `diagnose` runs one bounded real probe.
+
+A short `chatstone` link is created only in an existing, safe user directory
+already on PATH. No shell profile is edited; otherwise printed hints contain
+the full executable path. Ctrl-C pauses foreground import safely; resume with
+the full path above followed by `resume`.
 
 The reader opens only Claude's `projects/` or Codex's `sessions/` and
 `archived_sessions/` (honoring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`). Messages,
@@ -85,10 +96,23 @@ included or qualified here.
 
 ## Update and remove
 
-Claude: `/plugin marketplace update chatstone`, then `/plugin update chatstone@chatstone`.
-Codex: `codex plugin marketplace upgrade chatstone`, then remove/add the plugin
-and review `/hooks` again. A newer plugin atomically installs its exact pinned
-runner; a bad hash is never executed.
+Close both harnesses before updating the shared runner (an old 0.2.0 launcher
+would otherwise reinstall its old pin). In a terminal:
+
+```sh
+claude plugin marketplace update chatstone
+claude plugin update chatstone@chatstone --scope user
+sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/chatstone/chatstone/0.2.1/launcher.sh" --version
+codex plugin marketplace upgrade chatstone
+codex plugin remove chatstone@chatstone
+codex plugin add chatstone@chatstone
+sh "${CODEX_HOME:-$HOME/.codex}/plugins/cache/chatstone/chatstone/0.2.1/launcher.sh" --version
+```
+
+Each launcher verifies its exact pin before atomic replacement and resumes
+existing imports automatically. Credentials and queues survive; do **not**
+log in again. Restart both harnesses; review and trust changed Codex hooks in
+`/hooks` again. Inspect progress with the full runner path followed by `status`.
 
 Uninstall via `/plugin uninstall chatstone@chatstone` (Claude) or
 `codex plugin remove chatstone@chatstone` (Codex). Run

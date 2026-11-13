@@ -32,6 +32,10 @@ if [ ! -f "$runner" ] || [ -L "$runner" ] || [ "$(hash "$runner")" != "$expected
  [ "$(hash "$stage/$product")" = "$expected" ] || fail SHA256_MISMATCH
  chmod 700 "$stage/$product"
  mv -f -- "$stage/$product" "$runner"
+ # Updating restarts configured, resumable imports; keys/queue are untouched.
+ mkdir -p "$base/native/tmp"
+ chmod 700 "$base/native/tmp"
+ TMPDIR=$base/native/tmp "$runner" resume >/dev/null 2>&1 || true
  rm -rf -- "$stage"
  trap - EXIT HUP INT TERM
 fi

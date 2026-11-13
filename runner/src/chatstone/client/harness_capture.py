@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import replace
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from chatstone.collectors.contracts import ParseLimits, SourceIdentity
 from chatstone.collectors.harnesses import _json, _zstd_chunks
-from chatstone.collectors.live_harnesses import SkipRecord, project
+from chatstone.collectors.live_harnesses import SkipRecord, project, session_payload
 from chatstone.collectors.policy import checked_path, credential_name, open_explicit
 from chatstone.collectors.wire import RequestError, decode_record
 
@@ -56,6 +57,52 @@ def prepare(spool):
             '(identity TEXT, native TEXT, occurrence INTEGER, PRIMARY KEY(identity,native))')
         spool._db.execute('CREATE TABLE IF NOT EXISTS harness_skips '
             '(identity TEXT, position INTEGER, digest TEXT, cause TEXT, PRIMARY KEY(identity,position))')
+        if 'record_type' not in {r[1] for r in spool._db.execute('PRAGMA table_info(harness_skips)')}:
+            spool._db.execute("ALTER TABLE harness_skips ADD COLUMN record_type TEXT NOT NULL DEFAULT 'legacy'")
+        spool._db.execute('CREATE TABLE IF NOT EXISTS harness_sessions(native TEXT PRIMARY KEY,payload TEXT,sent TEXT)')
+        spool._db.execute('CREATE TABLE IF NOT EXISTS harness_parser(version INTEGER)')
+        if spool._db.execute('SELECT version FROM harness_parser').fetchone() != (2,):
+            # Keep install, queue and seen fingerprints. Re-read old parser skips
+            # and populate missing session metadata without resending messages.
+            spool._db.execute("UPDATE harness_files SET position=0,prefix=?,context='{}',size=-1", (hashlib.sha256(b'').hexdigest(),))
+            spool._db.execute('DELETE FROM harness_skips')
+            spool._db.execute('DELETE FROM harness_parser')
+            spool._db.execute('INSERT INTO harness_parser VALUES(2)')
+
+
+def record_name(raw):
+    def tag(value):
+        return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', value) else 'invalid_type'
+    name = tag(raw.get('type')) if isinstance(raw, dict) else 'invalid_object'
+    if isinstance(raw, dict):
+        child = raw.get('payload')
+        if name in ('response_item', 'event_msg') and isinstance(child, dict):
+            name += '/'+tag(child.get('type'))
+        elif name == 'attachment' and isinstance(raw.get('attachment'), dict):
+            name += '/'+tag(raw['attachment'].get('type'))
+        elif name == 'system' and raw.get('subtype'):
+            name += '/'+tag(raw['subtype'])
+    return name
+
+
+def store_session(spool, value):
+    if value is None:
+        return
+    previous = spool._db.execute('SELECT payload FROM harness_sessions WHERE native=?', (value['native_session_id'],)).fetchone()
+    if previous:
+        old = json.loads(previous[0])
+        merged = {k: value.get(k) if value.get(k) is not None else v for k, v in old.items()}
+        ranks = {'first_prompt': 1, 'summary': 2, 'custom': 3}
+        if ranks.get(old['meta'].get('title_source'), 0) > ranks.get(value['meta'].get('title_source'), 0):
+            merged['title'], merged['meta'] = old['title'], {**value['meta'], 'title_source': old['meta'].get('title_source')}
+        from datetime import datetime
+        for field, chooser in (('started_at', min), ('ended_at', max)):
+            stamps = [v for v in (old.get(field), value.get(field)) if v]
+            merged[field] = chooser(stamps, key=datetime.fromisoformat) if stamps else None
+        value = merged
+    spool._db.execute('INSERT INTO harness_sessions VALUES(?,?,NULL) ON CONFLICT(native) '
+                      'DO UPDATE SET payload=excluded.payload',
+                      (value['native_session_id'], json.dumps(value, sort_keys=True, separators=(',', ':'))))
 
 
 def retry_skipped(spool):
@@ -92,7 +139,7 @@ def _decoded(handle, compressed, limits):
         yield decoded
 
 
-def capture(spool, root, *, attachment_roots=(), limits=None, max_lines=2048, paths=None):
+def capture(spool, root, *, attachment_roots=(), limits=None, max_lines=2048, paths=None, cursor_prefix=''):
     """One bounded pass. Failures in queue/disk/network NEVER become skips.
 
     Skips retain content-free cause, digest and position. A rewritten/repaired
@@ -107,7 +154,7 @@ def capture(spool, root, *, attachment_roots=(), limits=None, max_lines=2048, pa
             break
         with open_explicit(path) as source:
             info = os.fstat(source.fileno())
-            key = f'{info.st_dev}:{info.st_ino}'
+            key = cursor_prefix+f'{info.st_dev}:{info.st_ino}'
             previous = spool._db.execute('SELECT position,prefix,context,size,mtime,ctime FROM harness_files WHERE identity=?', (key,)).fetchone()
             if previous and previous[3:] == (info.st_size, info.st_mtime_ns, info.st_ctime_ns):
                 continue
@@ -141,12 +188,14 @@ def capture(spool, root, *, attachment_roots=(), limits=None, max_lines=2048, pa
                         break
                     end = handle.tell()
                     records, cause, updated = [], None, context
+                    record_type = 'invalid_json'
                     try:
                         if oversize:
                             raise SkipRecord('LINE_OVERSIZE')
                         raw, warnings = _json(line)
                         if warnings:
                             raise SkipRecord('JSON_INVALID')
+                        record_type = record_name(raw)
                         records, updated, cause = project(raw, source=identity, path=path,
                             context=context, limits=limits, attachment_roots=attachment_roots)
                         # Validate the exact wire boundary before durable admission.
@@ -198,18 +247,29 @@ def capture(spool, root, *, attachment_roots=(), limits=None, max_lines=2048, pa
                             version = (message.native_session_id, message.native_id, prepared[1])
                             # Latest-only seen fingerprints cannot recognize an
                             # older revision on a full replay after rotation.
+                            promote = getattr(spool, 'promote', None)
+                            if promote is not None:
+                                promote(message.native_session_id, message.native_id)
                             if spool._db.execute('SELECT 1 FROM harness_versions '
                                 'WHERE session=? AND native=? AND fingerprint=?', version).fetchone():
                                 continue
                             if spool._add_prepared(prepared):
                                 result['admitted'] += 1
                             spool._db.execute('INSERT INTO harness_versions VALUES(?,?,?)', version)
+                        if records:
+                            for record in records:
+                                meta = json.loads(record.message.native_source)
+                                store_session(spool, session_payload(updated, spool.source, path, session=record.message.native_session_id,
+                                              kind=meta.get('kind'), parent=meta.get('parent')))
+                        else:
+                            store_session(spool, session_payload(updated, spool.source, path))
+                        skip_key = key.removeprefix('live:')
                         if cause:
-                            spool._db.execute('INSERT OR REPLACE INTO harness_skips VALUES(?,?,?,?)',
-                                (key, start, row_hash.hexdigest(), cause))
+                            spool._db.execute('INSERT OR REPLACE INTO harness_skips VALUES(?,?,?,?,?)',
+                                (skip_key, start, row_hash.hexdigest(), cause, record_type))
                             result['skipped'] += 1
                         else:
-                            spool._db.execute('DELETE FROM harness_skips WHERE identity=? AND position=?', (key, start))
+                            spool._db.execute('DELETE FROM harness_skips WHERE identity=? AND position=?', (skip_key, start))
                         # Do not mark the file unchanged until we reached EOF.
                         done = end == handle.seek(0, os.SEEK_END)
                         handle.seek(end)

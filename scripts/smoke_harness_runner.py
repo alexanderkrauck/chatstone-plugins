@@ -10,6 +10,7 @@ import json
 import os
 import runpy
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -102,7 +103,7 @@ def main():
             env = {**os.environ, 'XDG_DATA_HOME': str(temp/'user data'), 'CURL_CA_BUNDLE': str(cert)}
             command = ['sh', str(launcher), '--version']
             result = subprocess.run(command, check=False, env=env, capture_output=True, text=True)
-            assert result.returncode == 0, 'LAUNCHER_DOWNLOAD_SMOKE_FAILED'
+            assert result.returncode == 0, ('LAUNCHER_DOWNLOAD_SMOKE_FAILED', result.returncode, result.stderr)
             installed = temp/'user data'/product/'bin'/product
             assert hashlib.sha256(installed.read_bytes()).hexdigest() == digest
             if os.uname().sysname == 'Darwin':
@@ -135,9 +136,23 @@ def main():
                 unavailable.bind(('127.0.0.1', 0))
                 unavailable.listen(1)
                 unavailable.settimeout(10)
+                accepted = []
                 def refuse_http():
                     with unavailable.accept()[0] as connection:
+                        accepted.append('lost')
                         connection.shutdown(socket.SHUT_RDWR)
+                    with unavailable.accept()[0] as connection:
+                        accepted.append('recovered')
+                        stream = connection.makefile('rb')
+                        stream.readline()
+                        length = 0
+                        while line := stream.readline():
+                            if line == b'\r\n':
+                                break
+                            if line.lower().startswith(b'content-length:'):
+                                length = int(line.split(b':', 1)[1])
+                        stream.read(length)
+                        connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}')
                 refusing = threading.Thread(target=refuse_http, daemon=True)
                 refusing.start()
                 private = config_root/'codex.json'
@@ -148,15 +163,27 @@ def main():
                 worker_env = {**env, 'XDG_CONFIG_HOME': str(temp/'config'), 'CHATSTONE_TEST_LOOPBACK': '1',
                               'TMPDIR': str(temp)}
                 subprocess.run([str(binary), 'sync', '--source', 'codex'], env=worker_env, check=True)
-                status_file = temp/'user data'/product/'native/codex.status'
+                status_file = temp/'user data'/product/'native/codex.error'
                 deadline = time.monotonic()+10
                 while not status_file.exists() and time.monotonic() < deadline:
                     time.sleep(.1)
                 assert status_file.exists(), 'DETACHED_FROZEN_WORKER_DID_NOT_START'
                 actual_status = json.loads(status_file.read_text())
-                assert actual_status == {'cause': 'TRANSPORT_ERROR'}, actual_status
+                assert actual_status['cause'] == 'TRANSPORT_ERROR' and type(actual_status['at']) is int, actual_status
+                success_file = status_file.with_suffix('.status')
+                deadline = time.monotonic()+15
+                while not success_file.exists() and time.monotonic() < deadline:
+                    time.sleep(.1)
+                assert success_file.exists(), 'DETACHED_WORKER_DID_NOT_RETRY'
+                assert json.loads(success_file.read_text())['pending'] == 0
+                private.unlink()
+                pid = json.loads(status_file.with_suffix('.worker').read_text())['pid']
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 refusing.join(5)
-                assert not refusing.is_alive(), 'DETACHED_WORKER_DID_NOT_REACH_TRANSPORT'
+                assert not refusing.is_alive() and accepted == ['lost', 'recovered'], 'DETACHED_WORKER_DID_NOT_REACH_TRANSPORT'
         finally:
             server.shutdown()
             server.server_close()

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -107,6 +108,72 @@ class Content(_Content):
                 super().read([block])
 
 
+def session_context(raw, ctx, source):
+    """Native metadata is separate from message fingerprints and revisions."""
+    payload = raw.get('payload') if source == 'codex' else raw
+    payload = payload if isinstance(payload, dict) else {}
+    message = raw.get('message') if isinstance(raw.get('message'), dict) else payload
+    session = raw.get('sessionId') if source == 'claude_code' else payload.get('id') if raw.get('type') == 'session_meta' else None
+    if isinstance(session, str):
+        ctx['session'] = session
+    for key in ('cwd', 'model'):
+        value = payload.get(key) or message.get(key)
+        if isinstance(value, str) and len(value.encode()) <= 4096 and '\x00' not in value:
+            ctx[key] = value
+    stamp = raw.get('timestamp') or (payload.get('timestamp') if raw.get('type') == 'session_meta' else None)
+    try:
+        parsed = datetime.fromisoformat(stamp)
+        if parsed.utcoffset() is None:
+            raise ValueError
+        if not ctx.get('started_at') or parsed < datetime.fromisoformat(ctx['started_at']):
+            ctx['started_at'] = stamp
+        if not ctx.get('ended_at') or parsed > datetime.fromisoformat(ctx['ended_at']):
+            ctx['ended_at'] = stamp
+    except (TypeError, ValueError):
+        pass
+    category = raw.get('type')
+    title, origin = None, None
+    if category in ('custom-title', 'ai-title', 'summary'):
+        title = raw.get('customTitle') or raw.get('aiTitle') or raw.get('summary')
+        origin = 'custom' if category == 'custom-title' else 'summary'
+    elif source == 'codex' and category == 'session_meta':
+        title = payload.get('thread_name') or payload.get('title')
+        origin = 'custom'
+    if not ctx.get('title') and message.get('role') == 'user':
+        content = message.get('content')
+        title = content if isinstance(content, str) else ' '.join(
+            b.get('text', '') for b in content or [] if isinstance(b, dict) and b.get('type') in ('text', 'input_text'))
+        origin = 'first_prompt'
+    ranks = {'first_prompt': 1, 'summary': 2, 'custom': 3}
+    if isinstance(title, str) and title.strip() and ranks.get(origin, 0) >= ranks.get(ctx.get('title_source'), 0):
+        # The harness lists a short first-prompt preview, not an entire prompt.
+        ctx['title'] = ' '.join(title.split())[:200] if origin == 'first_prompt' else title[:1000]
+        ctx['title_source'] = origin
+    return ctx
+
+
+def session_payload(ctx, source, path, *, session=None, kind=None, parent=None):
+    native = session or ctx.get('session')
+    if not isinstance(native, str) or not native:
+        return None
+    if session is None and source == 'claude_code' and path.stem.startswith('agent-'):
+        parent = path.parent.parent.name if path.parent.name == 'subagents' else native
+        native, kind = parent+':agent:'+path.stem[6:], 'subagent'
+    return {'native_session_id': native, 'kind': kind or ('subagent' if ctx.get('subagent') else 'interactive'),
+            'title': ctx.get('title'), 'model': ctx.get('model'), 'cwd': ctx.get('cwd'),
+            'project': ctx.get('project') or ctx.get('cwd'), 'started_at': ctx.get('started_at'),
+            'ended_at': ctx.get('ended_at'), 'parent_native_id': parent or ctx.get('parent'),
+            'meta': {'source': source, 'title_source': ctx.get('title_source'), 'end_reason': 'last_record'}}
+
+
+def opaque_content(value):
+    """Unknown native shapes with data are retained/searchable, never silently lost."""
+    if not isinstance(value, dict):
+        return None
+    data = {k: v for k, v in value.items() if k not in ('type', 'timestamp', 'sessionId', 'uuid', 'parentUuid', 'cwd', 'version')}
+    return canonical(data).decode() if data else None
+
+
 def project(raw, *, source, path, context, limits=None, attachment_roots=()):
     """Return projected records and context; caller assigns durable IDs/order.
 
@@ -116,17 +183,28 @@ def project(raw, *, source, path, context, limits=None, attachment_roots=()):
     limits = limits or ParseLimits()
     if not isinstance(raw, dict):
         raise SkipRecord('JSON_OBJECT_REQUIRED')
-    ctx = dict(context)
+    ctx = session_context(raw, dict(context), source.source)
+    fallback = False
     category = raw.get('type')
     if source.source == 'claude_code':
         message = raw.get('message')
         if category not in ('user', 'assistant') or not isinstance(message, dict):
             if category == 'system' and raw.get('subtype') == 'compact_boundary':
                 message = {'role': 'system', 'content': raw.get('content', '')}
+            elif category == 'attachment' and raw.get('rendered'):
+                # Current Claude persists model-visible system/user context in
+                # rendered blocks, not in a user/assistant message envelope.
+                message = {'role': raw.get('renderedRole') if raw.get('renderedRole') in ('user', 'assistant') else 'system',
+                           'content': raw['rendered']}
             elif category == 'summary' and isinstance(raw.get('summary'), str):
                 message = {'role': 'system', 'content': raw['summary']}
+            elif category in ('custom-title', 'ai-title', 'last-prompt', 'file-history-snapshot', 'tag', 'agent-name', 'agent-color', 'pr-link'):
+                return [], ctx, 'METADATA_RECORD'
+            elif opaque_content(raw):
+                message = {'role': 'system', 'content': opaque_content(raw)}
+                fallback = True
             else:
-                return [], ctx, 'UNKNOWN_RECORD' if category not in ('system', 'file-history-snapshot', 'progress', 'queue-operation') else 'METADATA_RECORD'
+                return [], ctx, 'UNKNOWN_RECORD'
         session = raw.get('sessionId') or ctx.get('session')
         if not session and category == 'summary':
             # Summary-only files cannot safely invent a session from a filename.
@@ -173,8 +251,10 @@ def project(raw, *, source, path, context, limits=None, attachment_roots=()):
         if category == 'turn_context':
             ctx['cwd'] = payload.get('cwd', ctx.get('cwd'))
             return [], ctx, None
-        if category == 'event_msg':
+        if category == 'event_msg' and payload.get('type') in ('user_message', 'agent_message', 'agent_reasoning', 'agent_reasoning_raw_content', 'agent_reasoning_section_break', 'task_complete'):
             return [], ctx, 'MIRROR_EVENT'
+        if category in ('dynamic_tools_updated', 'inter_agent_communication_metadata', 'token_usage_record', 'security_risk_score') or category == 'event_msg' and payload.get('type') in ('token_count', 'task_started', 'turn_started', 'turn_complete'):
+            return [], ctx, 'METADATA_RECORD'
         session = _native(ctx.get('session'))
         parent, kind = ctx.get('parent'), 'subagent' if ctx.get('subagent') else 'interactive'
         item = payload.get('type')
@@ -190,18 +270,21 @@ def project(raw, *, source, path, context, limits=None, attachment_roots=()):
             role = 'system'
             parsed.read(payload.get('message', ''))
         elif category != 'response_item':
-            return [], ctx, 'UNKNOWN_RECORD'
+            if not opaque_content(payload):
+                return [], ctx, 'UNKNOWN_RECORD'
+            role, fallback = 'system', True
+            parsed.read(canonical(payload).decode())
         elif item == 'message':
             role = payload.get('role')
             if role not in ('user', 'assistant', 'system', 'developer'):
                 raise SkipRecord('ROLE_INVALID')
             role = 'system' if role == 'developer' else role
             parsed.read(payload.get('content', []))
-        elif item in ('function_call', 'custom_tool_call'):
+        elif item in ('function_call', 'custom_tool_call', 'local_shell_call', 'web_search_call', 'tool_search_call'):
             role = 'assistant'
-            args = payload.get('arguments', '') if item == 'function_call' else payload.get('input', '')
+            args = payload.get('arguments', '') if item == 'function_call' else payload.get('input', payload.get('action', payload.get('arguments', '')))
             parsed.part('tool_call', args if isinstance(args, str) else canonical(args).decode(),
-                        call_id=payload.get('call_id'), name=payload.get('name'))
+                        call_id=payload.get('call_id'), name=payload.get('name') or item)
         elif item in ('function_call_output', 'custom_tool_call_output', 'mcp_tool_call_output'):
             role, call = 'tool', payload.get('call_id')
             output = payload.get('output', '')
@@ -210,12 +293,18 @@ def project(raw, *, source, path, context, limits=None, attachment_roots=()):
             parsed.read(output)
         elif item == 'reasoning':
             role = 'assistant'
-            for block in payload.get('summary') or []:
+            for block in (payload.get('summary') or [])+(payload.get('content') or []):
                 if isinstance(block, dict):
                     parsed.part('reasoning', block.get('text', ''))
             # Encrypted reasoning stays raw-only; never attempt decrypting it.
+        elif item in ('compaction', 'context_compaction'):
+            role = 'system'
+            parsed.read(payload.get('summary') or payload.get('content') or payload.get('message', ''))
         else:
-            return [], ctx, 'UNKNOWN_RESPONSE_ITEM'
+            if not opaque_content(payload):
+                return [], ctx, 'UNKNOWN_RESPONSE_ITEM'
+            role, fallback = 'system', True
+            parsed.read(canonical(payload).decode())
         fragments = [(native, role, parsed, call)]
     else:
         raise ValueError('SOURCE_UNSUPPORTED')
@@ -247,6 +336,8 @@ def project(raw, *, source, path, context, limits=None, attachment_roots=()):
             parsed.read(content)
         if derived:
             parsed.warnings.append('NATIVE_ID_DERIVED')
+        if fallback:
+            parsed.warnings.append('UNRECOGNIZED_RECORD_CAPTURED')
         if detached is not None:
             parsed.attachments.append(detached)
             parsed.parts.append(Part(kind='attachment', sha256=detached.sha256,
