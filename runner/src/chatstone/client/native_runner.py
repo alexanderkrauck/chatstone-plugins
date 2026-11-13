@@ -304,7 +304,7 @@ def main(argv=None):
         if args.action == 'parse':
             # Synthetic fixture only, no key or persistent user state needed.
             with tempfile.TemporaryDirectory() as temporary, Spool(
-                    Path(temporary)/'queue', source=args.source, host='synthetic', destination=ORIGIN) as spool:
+                    Path(temporary).resolve()/'queue', source=args.source, host='synthetic', destination=ORIGIN) as spool:
                 print(json.dumps(capture(spool, None, paths=[args.path.resolve()], max_lines=2048)))
             return 0
         if args.action == 'login':

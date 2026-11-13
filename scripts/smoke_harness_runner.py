@@ -38,7 +38,9 @@ def main():
                             capture_output=True, text=True, check=True)
     assert json.loads(parsed.stdout)['admitted'] == 3
     with tempfile.TemporaryDirectory() as temporary:
-        temp = Path(temporary)
+        # Darwin's stock /var temporary ancestor is a symlink. Resolve only
+        # this newly created synthetic root, never relax the real spool guard.
+        temp = Path(temporary).resolve()
         # Exercise the bundled native decoder, not just an uncompressed parser.
         rows = [{'type': 'session_meta', 'payload': {'id': 'synthetic-zstd'}}] + [
             {'type': 'response_item', 'payload': {'id': str(i), 'type': 'message', 'role': 'user',
@@ -103,6 +105,18 @@ def main():
             assert result.returncode == 0, 'LAUNCHER_DOWNLOAD_SMOKE_FAILED'
             installed = temp/'user data'/product/'bin'/product
             assert hashlib.sha256(installed.read_bytes()).hexdigest() == digest
+            if os.uname().sysname == 'Darwin':
+                # Assess the actual curl-acquired bytes, without removing any
+                # attributes or applying a developer signature/trust bypass.
+                for diagnostic in (['xattr', '-l', str(installed)],
+                                   ['codesign', '-dv', '--verbose=2', str(installed)]):
+                    subprocess.run(diagnostic, check=False)
+                subprocess.run(['xattr', '-w', 'com.apple.quarantine',
+                                '0081;00000000;NativePluginSmoke;', str(installed)], check=True)
+                subprocess.run([str(installed), '--version'], env=env, check=True)
+                assessed = subprocess.run(['spctl', '--assess', '--type', 'execute', str(installed)], check=False)
+                print(json.dumps({'mac_curl_quarantine_start': True,
+                                  'gatekeeper_assessment_exit': assessed.returncode}), flush=True)
             # A damaged cache forces acquisition; a bad server object must not
             # become executable or replace the installed bytes.
             installed.write_bytes(b'old nonexecutable data')
