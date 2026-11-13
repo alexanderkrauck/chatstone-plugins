@@ -145,7 +145,8 @@ def main():
                 while not status_file.exists() and time.monotonic() < deadline:
                     time.sleep(.1)
                 assert status_file.exists(), 'DETACHED_FROZEN_WORKER_DID_NOT_START'
-                assert json.loads(status_file.read_text()) == {'cause': 'TRANSPORT_ERROR'}
+                actual_status = json.loads(status_file.read_text())
+                assert actual_status == {'cause': 'TRANSPORT_ERROR'}, actual_status
         finally:
             server.shutdown()
             server.server_close()
