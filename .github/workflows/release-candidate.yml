@@ -1,0 +1,108 @@
+name: native-release-candidate
+on:
+  push:
+    branches: [candidate]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-candidate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+          - os: macos-15-intel
+            target: darwin-amd64
+          - os: ubuntu-24.04
+            target: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Native compression dependency
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install zstd
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y libzstd-dev
+          fi
+      - run: python -m pip install -r requirements-build.txt
+      - run: python scripts/build_harness_runner.py --out "$RUNNER_TEMP/native"
+      - name: Execute on the actual target, including HTTPS acquisition
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="$RUNNER_TEMP/native/chatstone-$TARGET"
+          test -f "$binary"
+          python scripts/smoke_harness_runner.py --binary "$binary"
+          if [ "$RUNNER_OS" = macOS ]; then
+            # Quarantine/Gatekeeper assessment is diagnostic until the owner
+            # supplies signing/notarization. It is not a trust verdict.
+            xattr -w com.apple.quarantine '0081;00000000;NativePluginSmoke;' "$binary"
+            "$binary" --version
+            spctl --assess --type execute "$binary" || true
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/native/chatstone-${{ matrix.target }}
+            ${{ runner.temp }}/native/chatstone-${{ matrix.target }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: native-*
+          path: assets
+          merge-multiple: true
+      - name: Stamp all four pinned hashes and assemble the exact marketplace
+        run: |
+          python scripts/stamp_harness_release.py --root . --assets assets --require-all
+          python - <<'PY'
+          import json, tarfile
+          from pathlib import Path
+          files = list(json.loads(Path('build.json').read_text())['sha256']) + ['build.json']
+          with tarfile.open('assets/marketplace.tar.gz', 'w:gz') as archive:
+              for name in sorted(files):
+                  archive.add(name, arcname=name, recursive=False)
+          PY
+      - name: Attach only after all native builds and smokes passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=$(python -c "import runpy;print(runpy.run_path('runner/src/chatstone/client/native_product.py')['RELEASE'])")
+          if gh release view "$release" --json isDraft --jq .isDraft > draft-state 2>/dev/null; then
+            test "$(cat draft-state)" = true
+          else
+            gh release create "$release" --draft --target "$GITHUB_SHA" --title "$release candidate" --notes 'Native candidate only. The owner must approve and publish the stamped marketplace.'
+          fi
+          gh release upload "$release" assets/* --clobber
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-ready
+          path: assets/*
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,16 @@
+{
+  "name": "chatstone",
+  "owner": {
+    "name": "Alexander Krauck"
+  },
+  "metadata": {
+    "description": "Private conversation archive integrations"
+  },
+  "plugins": [
+    {
+      "name": "chatstone",
+      "source": "./plugins/claude-code",
+      "description": "Archive and search Claude Code sessions"
+    }
+  ]
+}

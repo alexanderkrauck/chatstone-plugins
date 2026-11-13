@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "chatstone": {
+      "command": "sh",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/launcher.sh",
+        "mcp",
+        "--source",
+        "claude_code"
+      ]
+    }
+  }
+}

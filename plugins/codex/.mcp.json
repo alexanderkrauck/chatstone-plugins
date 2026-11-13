@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "chatstone": {
+      "command": "sh",
+      "args": [
+        "./launcher.sh",
+        "mcp",
+        "--source",
+        "codex"
+      ],
+      "cwd": "."
+    }
+  }
+}

@@ -1,0 +1,107 @@
+# chatstone for Claude Code and Codex
+
+Private conversation capture plus eight read-only archive/search tools. Native
+hooks wake a short-lived reader; no daemon, Python, Node or GitHub account is
+needed. Requires a supported native harness, POSIX sh, curl and stock OS utilities
+(including SHA-256). Linux and macOS only; Windows is not supported. The release
+workflow targets Ubuntu 24.04 for Linux; older distributions are unqualified.
+
+**Build candidate:** this repository becomes installable only after all four
+native jobs pass and an operator publishes the stamped marketplace and release.
+Do not install an unstamped candidate (its empty hashes intentionally refuse downloads).
+
+## Install
+
+Claude Code (native CLI, plugin management validated on 2.1.323; earlier versions unqualified):
+
+```text
+/plugin marketplace add https://github.com/alexanderkrauck/chatstone-plugins
+/plugin install chatstone@chatstone
+```
+
+The equivalent shell commands are `claude plugin marketplace add
+https://github.com/alexanderkrauck/chatstone-plugins` and `claude plugin install chatstone@chatstone`.
+Start a Claude session once to acquire the runner, then in a **separate terminal**:
+
+```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/chatstone/bin/chatstone" login --source claude_code
+```
+
+Codex CLI (released 0.169.0 supports this plugin layout):
+
+```sh
+codex plugin marketplace add https://github.com/alexanderkrauck/chatstone-plugins
+codex plugin add chatstone@chatstone
+codex
+```
+
+Review and trust the plugin hooks in `/hooks` (updates require review again).
+The first trusted wake acquires the runner. In a separate terminal:
+
+```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/chatstone/bin/chatstone" login --source codex
+```
+
+Enter an invitation-only enrollment code at the **hidden prompt**, never in chat
+or arguments. The operator binds it to your tenant, device name and chosen source.
+Keep the same device name for Hermes/Claude/Codex, with separate sources. Restart
+the harness after login so its MCP process reconnects. No key is stored in harness
+settings; both plugins start the local `chatstone mcp --source ...` proxy.
+
+## Capture, status and privacy
+
+Replace `codex` below with `claude_code` for Claude:
+
+```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/chatstone/bin/chatstone" backfill --source codex
+"${XDG_DATA_HOME:-$HOME/.local/share}/chatstone/bin/chatstone" status --source codex
+"${XDG_DATA_HOME:-$HOME/.local/share}/chatstone/bin/chatstone" diagnose --source codex
+```
+
+Backfill visits newest sessions first (native order inside each session).
+Ctrl-C pauses safely; the next run resumes. Live appends to completed sessions
+overtake queued history. Hooks reconcile on the next wake after a delayed flush.
+Bad records have a content-free skip reason and do not stall later records;
+`backfill --retry-skips` retries them after a reader update. `diagnose` performs
+one bounded real sync step. Offline/capacity failures keep the durable queue.
+
+The reader opens only Claude's `projects/` or Codex's `sessions/` and
+`archived_sessions/` (honoring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`). Messages,
+tool calls/results, session/project provenance, raw records and original inline
+attachments go to `https://api.chatstone.goedly.com` over verified HTTPS. Local
+file attachment reads are disabled by default; no arbitrary tool paths are read.
+Large inline data travels as binary attachments; large native JSON originals are
+also retained as attachments, with searchable message text left in place.
+The 2 MiB metadata/text envelope still applies; exceptional oversize rows are
+counted by reason. **25 MB message support is not claimed.** Archived instructions
+are untrusted data. Remote search is the existing eight-tool read-only surface.
+
+Keys live in `${XDG_CONFIG_HOME:-$HOME/.config}/chatstone/native/<source>.json`
+(0600, private directory); queue/status in the matching XDG data directory.
+Never edit harness headers to paste a key. These two harnesses support stdio;
+for remote-only clients, use a trusted credential-provider/environment bearer
+header, not a literal key in project configuration. No remote-only flow is
+included or qualified here.
+
+## Update and remove
+
+Claude: `/plugin marketplace update chatstone`, then `/plugin update chatstone@chatstone`.
+Codex: `codex plugin marketplace upgrade chatstone`, then remove/add the plugin
+and review `/hooks` again. A newer plugin atomically installs its exact pinned
+runner; a bad hash is never executed.
+
+Uninstall via `/plugin uninstall chatstone@chatstone` (Claude) or
+`codex plugin remove chatstone@chatstone` (Codex). Run
+`chatstone logout --source codex` (or `claude_code`) using the full binary path
+above to remove that source's local keys; ask the operator to revoke them.
+Queue/history are retained for recovery. Uninstalling does **not** delete the
+hosted archive. Do not remove a shared Hermes directory.
+
+Release assets: `https://github.com/alexanderkrauck/chatstone-plugins/releases`.
+The public workflow builds native Linux x86_64/ARM64 and macOS Intel/ARM64 runners,
+executes version/fixture/TLS acquisition/hash-refusal smokes on each, and creates
+a **draft** release only if all pass. An operator must publish the stamped
+marketplace and draft afterwards. No macOS trust claim: signing/notarization and
+an actual interactive Mac harness session still need qualification.
+
+MIT for this payload only. Copyright (c) 2026 Alexander Krauck.

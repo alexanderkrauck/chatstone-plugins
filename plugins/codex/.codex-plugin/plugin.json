@@ -1,0 +1,13 @@
+{
+  "name": "chatstone",
+  "version": "0.2.0",
+  "description": "Archive local conversations and search your private archive.",
+  "author": {
+    "name": "Alexander Krauck"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "repository": "https://github.com/alexanderkrauck/chatstone-plugins"
+}
