@@ -125,13 +125,21 @@ def main():
             assert refusal.returncode != 0 and 'SHA256_MISMATCH' in refusal.stderr
             assert installed.read_bytes() == b'old nonexecutable data'
             # A detached onefile child must still reach Python after its parent
-            # has exited and removed its extraction directory. Use a synthetic
-            # key and a reserved, non-listening loopback port; no service is mocked.
+            # has exited and removed its extraction directory. A real TCP peer
+            # accepts then refuses HTTP: bind-without-listen times out on Darwin
+            # but is refused immediately on Linux. No API response is mocked.
             config_root = temp/'config'/product/'native'
             config_root.mkdir(parents=True, mode=0o700)
             token = '00000000-0000-0000-0000-000000000000.'+'synthetic_'+'x'*32
             with socket.socket() as unavailable:
                 unavailable.bind(('127.0.0.1', 0))
+                unavailable.listen(1)
+                unavailable.settimeout(10)
+                def refuse_http():
+                    with unavailable.accept()[0] as connection:
+                        connection.shutdown(socket.SHUT_RDWR)
+                refusing = threading.Thread(target=refuse_http, daemon=True)
+                refusing.start()
                 private = config_root/'codex.json'
                 private.write_text(json.dumps({'source': 'codex', 'device': 'synthetic', 'roots': [],
                     'origin': 'http://127.0.0.1:'+str(unavailable.getsockname()[1]),
@@ -147,6 +155,8 @@ def main():
                 assert status_file.exists(), 'DETACHED_FROZEN_WORKER_DID_NOT_START'
                 actual_status = json.loads(status_file.read_text())
                 assert actual_status == {'cause': 'TRANSPORT_ERROR'}, actual_status
+                refusing.join(5)
+                assert not refusing.is_alive(), 'DETACHED_WORKER_DID_NOT_REACH_TRANSPORT'
         finally:
             server.shutdown()
             server.server_close()
