@@ -170,6 +170,16 @@ def main():
                 assert status_file.exists(), 'DETACHED_FROZEN_WORKER_DID_NOT_START'
                 actual_status = json.loads(status_file.read_text())
                 assert actual_status['cause'] == 'TRANSPORT_ERROR' and type(actual_status['at']) is int, actual_status
+                # Qualify safe takeover of the legacy PID-only worker record on
+                # each real OS, without pretending that replacing a file stops it.
+                worker_file = status_file.with_suffix('.worker')
+                previous_worker = json.loads(worker_file.read_text())
+                worker_file.write_text(json.dumps({'pid': previous_worker['pid']}))
+                subprocess.run([str(binary), 'resume'], env=worker_env, check=True, capture_output=True)
+                replacement_deadline = time.monotonic()+5
+                while json.loads(worker_file.read_text())['pid'] == previous_worker['pid'] and time.monotonic() < replacement_deadline:
+                    time.sleep(.1)
+                assert json.loads(worker_file.read_text())['pid'] != previous_worker['pid'], 'OLD_WORKER_WAS_NOT_REPLACED'
                 success_file = status_file.with_suffix('.status')
                 deadline = time.monotonic()+45
                 while not success_file.exists() and time.monotonic() < deadline:

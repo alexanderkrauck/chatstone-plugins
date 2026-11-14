@@ -119,7 +119,7 @@ sh "${CODEX_HOME:-$HOME/.codex}/plugins/cache/chatstone/chatstone/0.2.2/launcher
 ```
 
 Each launcher verifies its exact pin before atomic replacement and resumes
-existing imports automatically. Credentials and queues survive; do **not**
+existing imports automatically. A verified obsolete detached worker is stopped automatically; current workers and unrelated/recycled PIDs are left alone. Credentials and queues survive; do **not**
 log in again. Restart both harnesses; review and trust changed Codex hooks in
 `/hooks` again. Inspect progress with the full runner path followed by `status`.
 

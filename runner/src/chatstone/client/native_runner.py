@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -640,6 +641,47 @@ def transient(error):
           and error.code not in {'INGEST_DISABLED', 'INGEST_CAPACITY_EXCEEDED'}))
 
 
+def retire_obsolete_worker(source):
+    """Replace a detached old runner too, not just its executable on disk."""
+    try:
+        previous = private_read(folder('data')/(source+'.worker'))
+    except ClientError as error:
+        if error.code == 'NOT_LOGGED_IN':
+            return
+        raise
+    if previous.get('version') == VERSION:
+        return
+    pid = previous.get('pid')
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        raise ClientError('UPDATE_WORKER_UNVERIFIED')
+    # Legacy 0.2.1 records have only a PID. Never signal from that alone: it may
+    # have been recycled. ps is available on both supported native platforms.
+    result = subprocess.run(['ps', '-ww', '-p', str(pid), '-o', 'uid=', '-o', 'command='],
+                            capture_output=True, text=True, timeout=3, check=False)
+    if result.returncode == 1 and not result.stdout.strip():
+        return  # The recorded worker has already exited.
+    fields = result.stdout.strip().split(None, 1)
+    command = ([sys.executable] if getattr(sys, 'frozen', False) else
+               [sys.executable, '-m', 'chatstone.client.native_runner'])
+    prefixes = [' '.join(command+[action, '--source', source, '--worker']) for action in ('sync', 'backfill')]
+    if (result.returncode != 0 or len(fields) != 2 or fields[0] != str(os.getuid())
+            or not any(fields[1] == prefix or fields[1].startswith(prefix+' ') for prefix in prefixes)):
+        return  # Stale/recycled PID: leave its new owner alone and wake normally.
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    end = time.monotonic()+5
+    while True:
+        try:
+            with lease(source+'-worker'):
+                return
+        except ClientError as error:
+            if error.code != 'SYNC_BUSY' or time.monotonic() >= end:
+                raise ClientError('UPDATE_WORKER_BUSY') from None
+            time.sleep(.1)
+
+
 def reset_refusals(config):
     """Explicit resume retries conclusive quota denials, never uncertain ACKs."""
     with lease(config['source']), open_spool(config) as spool, spool._transaction():
@@ -854,6 +896,7 @@ def main(argv=None):
             command = command_name()
             for source in SOURCES:
                 if config_path(source).exists():
+                    retire_obsolete_worker(source)
                     try:
                         reset_refusals(load(source))
                     except ClientError as error:
@@ -908,7 +951,7 @@ def main(argv=None):
             if getattr(args, 'worker', False):
                 try:
                     with lease(args.source+'-worker'):
-                        private_write(folder('data')/(args.source+'.worker'), {'pid': os.getpid()})
+                        private_write(folder('data')/(args.source+'.worker'), {'pid': os.getpid(), 'version': VERSION})
                         return run_steps(config, args)
                 except ClientError as error:
                     if error.code == 'SYNC_BUSY':
