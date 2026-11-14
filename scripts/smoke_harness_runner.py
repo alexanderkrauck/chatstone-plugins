@@ -182,10 +182,14 @@ def main():
                 assert json.loads(worker_file.read_text())['pid'] != previous_worker['pid'], 'OLD_WORKER_WAS_NOT_REPLACED'
                 success_file = status_file.with_suffix('.status')
                 deadline = time.monotonic()+45
-                while not success_file.exists() and time.monotonic() < deadline:
+                summary = {}
+                while time.monotonic() < deadline:
+                    summary = json.loads(success_file.read_text()) if success_file.exists() else {}
+                    if summary.get('last_sync', 0) >= actual_status['at']:
+                        break  # Only a completed step, not the pre-socket queue summary.
                     time.sleep(.1)
-                assert success_file.exists(), 'DETACHED_WORKER_DID_NOT_RETRY'
-                assert json.loads(success_file.read_text())['pending'] == 0
+                assert summary.get('last_sync', 0) >= actual_status['at'], 'DETACHED_WORKER_DID_NOT_RETRY'
+                assert summary['pending'] == 0
                 private.unlink()
                 pid = json.loads(status_file.with_suffix('.worker').read_text())['pid']
                 try:
