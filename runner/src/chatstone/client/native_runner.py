@@ -11,7 +11,6 @@ import re
 import shlex
 import shutil
 import signal
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -19,7 +18,7 @@ import tempfile
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -58,6 +57,9 @@ class NativeSpool(Spool):
             self._db.execute('CREATE TABLE IF NOT EXISTS native_retry('
                 'batch TEXT PRIMARY KEY,attempts INTEGER,code TEXT,bytes INTEGER,next_at REAL)')
             self._db.execute('DELETE FROM native_retry WHERE batch NOT IN (SELECT batch FROM pending)')
+            self._db.execute('CREATE TABLE IF NOT EXISTS native_blobs('
+                'batch TEXT,digest TEXT,PRIMARY KEY(batch,digest))')
+            self._db.execute('DELETE FROM native_blobs WHERE batch NOT IN (SELECT batch FROM pending)')
             self._db.execute('CREATE TABLE IF NOT EXISTS native_health('
                 'kind TEXT PRIMARY KEY,at REAL,code TEXT)')
             for batch, payload in self._db.execute('SELECT batch,payload FROM pending WHERE batch NOT IN (SELECT batch FROM native_identity)'):
@@ -101,10 +103,10 @@ class NativeSpool(Spool):
                     'last_success': {}, 'last_failure': {}, 'active_pending': value['pending'], 'next_retry': None}
         count, largest, attempts = self._db.execute(
             "SELECT count(*),coalesce(max(bytes),0),coalesce(max(attempts),0) FROM native_retry "
-            "WHERE attempts>=3 AND code!='AWAITING_RECEIPT'").fetchone()
+            "WHERE (attempts>=3 OR code='UPLOAD_BODY_TIMEOUT') AND code!='AWAITING_RECEIPT'").fetchone()
         value['set_aside'] = {'count': count, 'largest_bytes': largest, 'max_attempts': attempts,
             'reasons': dict(self._db.execute("SELECT code,count(*) FROM native_retry "
-                "WHERE attempts>=3 AND code!='AWAITING_RECEIPT' GROUP BY code"))}
+                "WHERE (attempts>=3 OR code='UPLOAD_BODY_TIMEOUT') AND code!='AWAITING_RECEIPT' GROUP BY code"))}
         for kind in ('success', 'failure'):
             row = self._db.execute('SELECT at,code FROM native_health WHERE kind=?', (kind,)).fetchone()
             value['last_'+kind] = {'at': row[0], 'cause': row[1]} if row else {}
@@ -119,13 +121,15 @@ class NativeSpool(Spool):
         # Only conclusive operator-wide refusals stop the worker. An uncertain
         # ACK always replays its original ID, never a new logical upload.
         if error.code in {'INVALID_KEY', 'UNAUTHORIZED', 'FORBIDDEN', 'INGEST_DISABLED',
-                          'INGEST_CAPACITY_EXCEEDED', 'QUOTA_EXCEEDED', 'SPOOL_IO',
+                          'INGEST_CAPACITY_EXCEEDED', 'QUOTA_EXCEEDED', 'SPOOL_IO', 'SPOOL_BUSY', 'SYNC_BUSY',
                           'SPOOL_FULL', 'SPOOL_CORRUPT', 'SPOOL_IDENTITY_MISMATCH'} or error.status in (401, 403, 507):
             raise error
         with self._transaction():
             row = self._db.execute('SELECT attempts FROM native_retry WHERE batch=?', (batch,)).fetchone()
             attempts = (row[0] if row else 0)+1
             pause = (30, 60)[attempts-1] if attempts < 3 else min(3600, 300*2**min(attempts-3, 4))
+            if error.code == 'UPLOAD_BODY_TIMEOUT':
+                pause = min(3600, 300*2**min(attempts-1, 4))
             if error.code == 'AWAITING_RECEIPT':
                 pause = min(60, .25*2**min(attempts-1, 8))
             self._db.execute('INSERT OR REPLACE INTO native_retry VALUES(?,?,?,?,?)',
@@ -160,9 +164,14 @@ class NativeSpool(Spool):
         if not batches:
             return 0
 
+        accepted = {batch['batch_id']: {row[0] for row in self._db.execute(
+            'SELECT digest FROM native_blobs WHERE batch=?', (batch['batch_id'],))} for batch in batches}
+
         def stage(batch):
+            known = accepted[batch['batch_id']]
             try:
-                return {**batch, 'records': client._stage_attachments(self.install_id, batch['records'], None)}, None
+                records = client._stage_attachments(self.install_id, batch['records'], None, staged=known)
+                return {**batch, 'records': records}, None
             except ClientError as error:
                 return batch, error
 
@@ -170,6 +179,14 @@ class NativeSpool(Spool):
         # its entire message, not the other messages in this window.
         with ThreadPoolExecutor(max_workers=4) as executor:
             outcomes = list(executor.map(stage, batches))
+        # Persist positive blob acknowledgments before enqueue. Originals remain
+        # unchanged until a final message receipt. One write group, not per part.
+        new_blobs = [(batch, digest) for batch, digests in accepted.items() for digest in digests
+            if not self._db.execute('SELECT 1 FROM native_blobs WHERE batch=? AND digest=?',
+                                    (batch, digest)).fetchone()]
+        if new_blobs:
+            with self._transaction():
+                self._db.executemany('INSERT OR IGNORE INTO native_blobs VALUES(?,?)', new_blobs)
         staged = []
         for batch, error in outcomes:
             if error is not None:
@@ -202,6 +219,7 @@ class NativeSpool(Spool):
                 if receipt == 'applied':
                     self._db.execute('DELETE FROM pending WHERE batch=?', (batch,))
                     self._db.execute('DELETE FROM native_retry WHERE batch=?', (batch,))
+                    self._db.execute('DELETE FROM native_blobs WHERE batch=?', (batch,))
                     self._db.execute("INSERT OR REPLACE INTO native_health VALUES('success',?,NULL)", (time.time(),))
                     delivered += 1
                 else:
@@ -514,6 +532,9 @@ def step(config, *, history=False, lines=256, client=None):
         client = client or IngestClient(config['origin'], secret_getter=lambda: config['ingest_key'],
                               allow_loopback_http=loopback(), timeout=15)
         client.ordered = True
+        summary = folder('data')/(config['source']+'.status')
+        if not summary.exists():
+            private_write(summary, snapshot(spool))
         total['delivered'] = spool.flush(client)
         if total['delivered']:
             private_write(folder('data')/(config['source']+'.upload'), {'at': int(time.time())})
@@ -531,51 +552,29 @@ def snapshot(spool):
     value['skips'] = dict(spool._db.execute('SELECT cause,count(*) FROM harness_skips GROUP BY cause'))
     value['skipped_types'] = dict(spool._db.execute('SELECT record_type,count(*) FROM harness_skips GROUP BY record_type'))
     value['found'] = spool._db.execute('SELECT count(*) FROM harness_ids').fetchone()[0]
+    value['files'] = spool._db.execute('SELECT count(DISTINCT path) FROM harness_files').fetchone()[0]
     waiting = spool._db.execute('SELECT count(DISTINCT i.native) FROM native_identity i JOIN pending p ON i.batch=p.batch').fetchone()[0]
     value['uploaded'] = max(0, value['found']-waiting)
     return value
 
 
 def read_snapshot(config):
-    # Uploaders retain their process lock across sockets, but SQLite transactions
-    # are short. Inspect a consistent read-only snapshot without taking that lock;
-    # do not use immutable=1, which could expose uncommitted rollback-journal pages.
-    path = folder('data')/(config['source']+'.sqlite')
-    if not path.exists():
-        with open_spool(config) as spool:
-            prepare(spool)
-    for ancestor in (*reversed(path.parents), path):
-        if ancestor.is_symlink():
-            raise ClientError('SPOOL_UNSAFE')
-    info = path.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o700):
-        raise ClientError('SPOOL_UNSAFE')
-    for item in path.iterdir():
-        if item.name not in ('.lock', 'spool.sqlite3', 'spool.sqlite3-journal'):
-            raise ClientError('SPOOL_UNSAFE')
-        try:
-            Spool._check_file(item.lstat())
-        except FileNotFoundError:
-            if item.name != 'spool.sqlite3-journal':
-                raise ClientError('SPOOL_BUSY') from None
+    # DELETE-journal readers hold SHARED locks: even a read-only status poll can
+    # make the writer's timeout=0 FULL-sync commit fail with SQLITE_BUSY. Status
+    # reads only the atomically published content-free summary, never SQLite or
+    # either worker/spool lease. A summary may lag an in-flight upload.
     try:
-        with closing(sqlite3.connect((path/'spool.sqlite3').as_uri()+'?mode=ro', uri=True, timeout=1)) as db:
-            db.execute('PRAGMA trusted_schema=OFF')
-            db.execute('PRAGMA query_only=ON')
-            db.execute('BEGIN')
-            row = db.execute('SELECT source,host,destination,version FROM identity WHERE id=1').fetchone()
-            if row != (config['source'], config['device'], config['origin'].rstrip('/'), 2):
-                raise ClientError('SPOOL_IDENTITY_MISMATCH')
-            # Reuse the identical content-free queries, without opening/migrating
-            # a writer or making the status path an alternative queue owner.
-            view = object.__new__(NativeSpool)
-            view._db = db
-            value = snapshot(view)
-            value['files'] = db.execute('SELECT count(DISTINCT path) FROM harness_files').fetchone()[0]
-            return value
-    except sqlite3.OperationalError as error:
-        raise ClientError('SPOOL_BUSY' if error.sqlite_errorcode in (5, 6) else 'SPOOL_CORRUPT') from None
+        value = private_read(folder('data')/(config['source']+'.status'))
+    except ClientError as error:
+        if error.code != 'NOT_LOGGED_IN':
+            raise
+        value = {'snapshot_pending': True}
+    # A running 0.2.1 may have published the older summary shape.
+    defaults = {'pending': 0, 'found': 0, 'uploaded': 0, 'files': 0,
+        'skips': {}, 'skipped_types': {}, 'last_success': {}, 'last_failure': {},
+        'next_retry': None, 'set_aside': {'count': 0, 'reasons': {},
+            'largest_bytes': 0, 'max_attempts': 0}}
+    return {**defaults, **value}
 
 
 def status(config):
@@ -720,6 +719,10 @@ def run_steps(config, args):
                 if not args.json:
                     print_status(value)
                 return 1
+            if code in ('SYNC_BUSY', 'SPOOL_BUSY', 'SPOOL_IO:SQLITE_BUSY', 'SPOOL_IO:SQLITE_LOCKED'):
+                # Local contention is neither an upload attempt nor a connection failure.
+                time.sleep(.05)
+                continue
             failures += 1
             if code not in ('SYNC_BUSY', 'SPOOL_BUSY'):
                 private_write(folder('data')/(args.source+'.error'), {'cause': code, 'at': int(time.time())})
@@ -856,6 +859,9 @@ def hook_stamp(hook):
 
 
 def print_status(value):
+    if value.get('snapshot_pending'):
+        print(value['source']+' '+value['version']+': preparing queue summary; queued messages are safe.')
+        return
     success, failure = value.get('last_success', value['upload']), value.get('last_failure', value['error'])
     aside = value.get('set_aside', {})
     print(f"{value['source']} {value['version']}: {value['found']} found, {value['uploaded']} uploaded, "
@@ -863,7 +869,8 @@ def print_status(value):
     print('Last successful upload: '+stamp(success.get('at'))+'; last failed upload: '+
           stamp(failure.get('at'))+(' ('+failure.get('cause', 'unknown')+')' if failure else '')+'.')
     if aside.get('count'):
-        reasons = ', '.join(k+'='+str(n) for k, n in sorted(aside['reasons'].items()))
+        labels = {'UPLOAD_BODY_TIMEOUT': 'UPLOAD_BODY_TIMEOUT (too large for this connection)'}
+        reasons = ', '.join(labels.get(k, k)+'='+str(n) for k, n in sorted(aside['reasons'].items()))
         print(f"Set aside: {reasons}; largest {aside['largest_bytes']} bytes; "
               f"up to {aside['max_attempts']} attempts; retry automatically after {stamp(value.get('next_retry'))}.")
     if value['skips'] or value['skipped_types']:

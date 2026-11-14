@@ -69,7 +69,12 @@ waits 5 minutes, then 10/20/40/60 minutes (one-hour cap). The background importe
 retries on its own; no new login or command. Later revisions of that same native
 message wait behind it; other messages retain live/history priority.
 Upload time scales with body size: 1 Mbit/s plus 50% margin and 15 seconds setup,
-capped at 300 seconds. Read-tool timeouts are unchanged.
+capped at the server's 120-second body limit (8 MB gets 111 seconds). A body that
+cannot finish is set aside immediately as `UPLOAD_BODY_TIMEOUT` (too large for
+this connection), with its size, then retried after 5/10/20/40/60 minutes.
+Read-tool timeouts are unchanged. Accepted parts are not re-sent for message
+receipt polling or restart; a lost positive blob ACK or crash before its local
+receipt commits can require one repeat per ambiguous event.
 Invalid/revoked keys, disabled ingestion and exhausted capacity stop
 with an explanation and a next step. Queued records remain safe.
 

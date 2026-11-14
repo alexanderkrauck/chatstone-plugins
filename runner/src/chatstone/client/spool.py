@@ -177,7 +177,8 @@ class Spool:
         except BaseException as error:
             self._db.rollback()
             if isinstance(error, sqlite3.Error):
-                code = 'SPOOL_FULL' if error.sqlite_errorcode == sqlite3.SQLITE_FULL else 'SPOOL_IO'
+                code = ('SPOOL_BUSY' if error.sqlite_errorcode & 255 in (5, 6) else
+                        'SPOOL_FULL' if error.sqlite_errorcode == sqlite3.SQLITE_FULL else 'SPOOL_IO')
                 raise ClientError(code) from None
             raise
 

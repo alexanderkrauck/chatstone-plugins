@@ -96,6 +96,7 @@ jobs:
           release=$(python -c "import runpy;print(runpy.run_path('runner/src/chatstone/client/native_product.py')['RELEASE'])")
           if gh release view "$release" --json isDraft --jq .isDraft > draft-state 2>/dev/null; then
             test "$(cat draft-state)" = true
+            gh release edit "$release" --target "$GITHUB_SHA"
           else
             gh release create "$release" --draft --target "$GITHUB_SHA" --title "$release candidate" --notes 'Native candidate only. The owner must approve and publish the stamped marketplace.'
           fi

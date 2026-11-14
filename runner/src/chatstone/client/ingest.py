@@ -2,6 +2,7 @@
 import base64
 import hashlib
 from dataclasses import asdict
+from time import monotonic
 from uuid import UUID
 
 from .transport import Client, ClientError, encode_json
@@ -116,11 +117,19 @@ class IngestClient(Client):
             return super()._request(path, body, media=media, deadline=deadline, timeout=timeout)
         # 1 Mbit/s (125,000 bytes/s), 50% transmission margin + 15s setup.
         # Read APIs retain their own timeout. Explicit aggregate deadlines win.
-        allowance = min(300, max(self.timeout, 15 + len(body) * 1.5 / 125_000))
+        allowance = min(120, max(self.timeout, 15 + len(body) * 1.5 / 125_000))
+        started = monotonic()
         try:
             return super()._request(path, body, media=media, deadline=deadline, timeout=allowance)
         except ClientError as error:
             error.upload_bytes = len(body)
+            if ('/blobs/' in path and deadline is None and (
+                    error.code in ('DEADLINE_EXCEEDED', 'REQUEST_TIMEOUT') or error.status == 408
+                    or ((error.code == 'TRANSPORT_ERROR' or (error.status or 0) >= 500)
+                        and monotonic()-started >= allowance-.5))):
+                failure = ClientError('UPLOAD_BODY_TIMEOUT', status=error.status)
+                failure.upload_bytes = len(body)
+                raise failure from None
             raise
 
     def register_source(self, *, install_id, source, host, deadline=None):
@@ -131,7 +140,7 @@ class IngestClient(Client):
         return self._request('/api/v1/ingest/sessions', encode_json({
             'install_id': identity(install_id), 'sessions': sessions}), deadline=deadline)
 
-    def _stage_attachments(self, install_id, records, deadline):
+    def _stage_attachments(self, install_id, records, deadline, *, staged=None):
         result = []
         for value in records:
             value = _wire_record(value)
@@ -145,8 +154,11 @@ class IngestClient(Client):
                         raise ClientError('INVALID_REQUEST') from None
                     if len(data) != item['size'] or hashlib.sha256(data).hexdigest() != item['sha256']:
                         raise ClientError('INVALID_REQUEST')
-                    self.upload_blob(install_id=install_id, kind='attachments', data=data,
-                                     deadline=deadline)
+                    if staged is None or item['sha256'] not in staged:
+                        self.upload_blob(install_id=install_id, kind='attachments', data=data,
+                                         deadline=deadline)
+                        if staged is not None:
+                            staged.add(item['sha256'])
                 attachments.append({**item, 'data_base64': None})
             result.append({**value, 'attachments': attachments})
         return result
