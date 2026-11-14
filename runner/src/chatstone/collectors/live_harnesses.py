@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import re
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -189,7 +190,22 @@ def project(raw, *, source, path, context, limits=None, attachment_roots=()):
     if source.source == 'claude_code':
         message = raw.get('message')
         if category not in ('user', 'assistant') or not isinstance(message, dict):
-            if category == 'system' and raw.get('subtype') == 'compact_boundary':
+            journal = isinstance(raw.get('key'), str) and re.fullmatch(r'v[0-9]+:[0-9a-f]{64}', raw['key']) and isinstance(raw.get('agentId'), str)
+            if (category in ('started', 'failed') and journal and
+                    set(raw) <= {'type', 'key', 'agentId', 'remoteSessionId', 'label', 'phaseTitle', 'phaseIndex'} or
+                    category in ('launched', 'restoring', 'restored', 'resumed') and
+                    set(raw) <= {'type', 'hiddenScriptSha256'}):
+                return [], ctx, 'LIFECYCLE_RECORD'
+            if category == 'result' and (journal or isinstance(raw.get('session_id'), str)):
+                # Workflow return values can be transformed/arbitrary data, not
+                # necessarily a duplicate of an assistant transcript message.
+                result = raw.get('result', raw.get('errors', ''))
+                message = {'role': 'system', 'content': result if isinstance(result, str) else canonical(result).decode()}
+                if journal:
+                    ctx['session'] = 'workflow:' + hashlib.sha256(str(path.parent).encode()).hexdigest()
+                else:
+                    ctx['session'] = raw['session_id']
+            elif category == 'system' and raw.get('subtype') == 'compact_boundary':
                 message = {'role': 'system', 'content': raw.get('content', '')}
             elif category == 'attachment' and raw.get('rendered'):
                 # Current Claude persists model-visible system/user context in

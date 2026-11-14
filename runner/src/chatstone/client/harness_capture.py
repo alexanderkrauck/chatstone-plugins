@@ -13,18 +13,24 @@ import json
 import os
 import re
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 from chatstone.collectors.contracts import ParseLimits, SourceIdentity
-from chatstone.collectors.harnesses import _json, _zstd_chunks
+from chatstone.collectors.harnesses import HarnessRejected, _json, _validate, _zstd_chunks
 from chatstone.collectors.live_harnesses import SkipRecord, project, session_payload
 from chatstone.collectors.policy import checked_path, credential_name, open_explicit
 from chatstone.collectors.wire import RequestError, decode_record
 
 from .ingest import encode_record
+from .native_product import VERSION
 from .transport import ClientError
+
+# Native history is not an import archive: long sessions routinely exceed 250 MB.
+# Plain JSONL has no lifetime byte/record cap; compressed snapshots bound disk use.
+NATIVE_LIMITS = replace(ParseLimits(), max_archive_uncompressed_bytes=4 * 1024**3)
 
 
 def discover(root, source):
@@ -59,15 +65,22 @@ def prepare(spool):
             '(identity TEXT, position INTEGER, digest TEXT, cause TEXT, PRIMARY KEY(identity,position))')
         if 'record_type' not in {r[1] for r in spool._db.execute('PRAGMA table_info(harness_skips)')}:
             spool._db.execute("ALTER TABLE harness_skips ADD COLUMN record_type TEXT NOT NULL DEFAULT 'legacy'")
+        for name, declaration in [('bytes', 'INTEGER NOT NULL DEFAULT 0'),
+                                  ('limit_bytes', 'INTEGER'), ('shape', "TEXT NOT NULL DEFAULT '{}'")]:
+            if name not in {r[1] for r in spool._db.execute('PRAGMA table_info(harness_skips)')}:
+                spool._db.execute('ALTER TABLE harness_skips ADD COLUMN '+name+' '+declaration)
+        spool._db.execute('CREATE TABLE IF NOT EXISTS harness_refusals('
+            'identity TEXT PRIMARY KEY,path TEXT,cause TEXT,bytes INTEGER,limit_bytes INTEGER,'
+            'observed_bytes INTEGER,shape TEXT,mtime INTEGER,ctime INTEGER,next_at REAL,version TEXT)')
         spool._db.execute('CREATE TABLE IF NOT EXISTS harness_sessions(native TEXT PRIMARY KEY,payload TEXT,sent TEXT)')
         spool._db.execute('CREATE TABLE IF NOT EXISTS harness_parser(version INTEGER)')
-        if spool._db.execute('SELECT version FROM harness_parser').fetchone() != (2,):
+        if spool._db.execute('SELECT version FROM harness_parser').fetchone() != (VERSION,):
             # Keep install, queue and seen fingerprints. Re-read old parser skips
             # and populate missing session metadata without resending messages.
             spool._db.execute("UPDATE harness_files SET position=0,prefix=?,context='{}',size=-1", (hashlib.sha256(b'').hexdigest(),))
             spool._db.execute('DELETE FROM harness_skips')
             spool._db.execute('DELETE FROM harness_parser')
-            spool._db.execute('INSERT INTO harness_parser VALUES(2)')
+            spool._db.execute('INSERT INTO harness_parser VALUES(?)', (VERSION,))
 
 
 def record_name(raw):
@@ -83,6 +96,26 @@ def record_name(raw):
         elif name == 'system' and raw.get('subtype'):
             name += '/'+tag(raw['subtype'])
     return name
+
+
+def shape(value, *, depth=0):
+    """Bounded structural example: key names, JSON types and UTF-8 sizes only."""
+    kind = ('null' if value is None else 'boolean' if isinstance(value, bool) else
+            'object' if isinstance(value, dict) else 'array' if isinstance(value, list) else
+            'string' if isinstance(value, str) else 'number')
+    size = len(value.encode()) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode())
+    result = {'type': kind, 'bytes': size}
+    if depth < 4 and isinstance(value, dict):
+        result['keys'] = {k if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', k) else '<other_key>':
+                          shape(v, depth=depth+1) for k, v in list(value.items())[:64]}
+    elif depth < 4 and isinstance(value, list):
+        result['items'] = [shape(v, depth=depth+1) for v in value[:3]]
+    return result
+
+
+def refusal_code(error):
+    code = error.code
+    return code if re.fullmatch(r'[A-Z_]{1,64}', code) else 'READER_REFUSED'
 
 
 def store_session(spool, value):
@@ -145,138 +178,162 @@ def capture(spool, root, *, attachment_roots=(), limits=None, max_lines=2048, pa
     Skips retain content-free cause, digest and position. A rewritten/repaired
     file replays them. max_lines bounds work, not the lifetime source size.
     """
-    limits = limits or ParseLimits()
+    limits = limits or NATIVE_LIMITS
     prepare(spool)
-    result = {'admitted': 0, 'skipped': 0, 'lines': 0, 'files': 0, 'resets': 0}
+    result = {'admitted': 0, 'skipped': 0, 'lines': 0, 'files': 0, 'resets': 0, 'refused_files': 0}
     identity = SourceIdentity(spool.source, spool.host)
     for path in (discover(root, spool.source) if paths is None else paths):
         if result['lines'] >= max_lines:
             break
-        with open_explicit(path) as source:
-            info = os.fstat(source.fileno())
-            key = cursor_prefix+f'{info.st_dev}:{info.st_ino}'
-            previous = spool._db.execute('SELECT position,prefix,context,size,mtime,ctime FROM harness_files WHERE identity=?', (key,)).fetchone()
-            if previous and previous[3:] == (info.st_size, info.st_mtime_ns, info.st_ctime_ns):
-                continue
-            with _decoded(source, path.name.endswith('.zst'), limits) as handle:
-                position, context, digest = 0, {}, hashlib.sha256()
-                if previous:
-                    position, expected, serialized = previous[:3]
-                    digest = _prefix(handle, position)
-                    if digest is None or digest.hexdigest() != expected:
-                        position, context, digest = 0, {}, hashlib.sha256()
-                        result['resets'] += 1
-                    else:
-                        context = json.loads(serialized)
-                handle.seek(position)
-                reset_occurrences = position == 0
-                result['files'] += 1
-                while result['lines'] < max_lines:
-                    start = handle.tell()
-                    line = handle.readline(min(limits.max_archive_member_bytes, 32 * 1024 * 1024) + 1)
-                    if not line:
-                        break
-                    oversize = len(line) > min(limits.max_archive_member_bytes, 32 * 1024 * 1024)
-                    row_hash = hashlib.sha256(line)
-                    digest.update(line)
-                    while line and not line.endswith(b'\n') and oversize:
-                        line = handle.readline(65536)
-                        row_hash.update(line)
-                        digest.update(line)
-                    if not line.endswith(b'\n'):
-                        # Do not consume incomplete/oversize partial records.
-                        break
-                    end = handle.tell()
-                    records, cause, updated = [], None, context
-                    record_type = 'invalid_json'
-                    try:
-                        if oversize:
-                            raise SkipRecord('LINE_OVERSIZE')
-                        raw, warnings = _json(line)
-                        if warnings:
-                            raise SkipRecord('JSON_INVALID')
-                        record_type = record_name(raw)
-                        records, updated, cause = project(raw, source=identity, path=path,
-                            context=context, limits=limits, attachment_roots=attachment_roots)
-                        # Validate the exact wire boundary before durable admission.
-                        for parsed in records:
-                            decode_record(encode_record(parsed))
-                            # Preflight the existing upload-envelope bound too;
-                            # a too-large raw frame belongs in the skip ledger,
-                            # never in a queue that can permanently block later rows.
-                            try:
-                                spool._prepare(parsed)
-                            except ClientError as error:
-                                if error.code not in ('REQUEST_TOO_LARGE', 'INVALID_REQUEST'):
-                                    raise
-                                raise SkipRecord('UPLOAD_ENVELOPE_OVERSIZE') from None
-                    except (SkipRecord, RequestError, UnicodeError, TypeError, KeyError, RecursionError) as error:
-                        records, updated = [], context
-                        cause = str(error) if isinstance(error, SkipRecord) else 'RECORD_INVALID'
-                    # Per-row transaction includes all fragments. Queue full rolls
-                    # back IDs/seen/cursor together, leaving the record retryable.
+        try:
+            with open_explicit(path) as source:
+                info = os.fstat(source.fileno())
+                key = cursor_prefix+f'{info.st_dev}:{info.st_ino}'
+                previous = spool._db.execute('SELECT position,prefix,context,size,mtime,ctime FROM harness_files WHERE identity=?', (key,)).fetchone()
+                if previous and previous[3:] == (info.st_size, info.st_mtime_ns, info.st_ctime_ns):
+                    continue
+                refused = spool._db.execute('SELECT bytes,mtime,ctime,next_at,version FROM harness_refusals WHERE identity=?',
+                                            (key.removeprefix('live:'),)).fetchone()
+                if refused and refused[:3] == (info.st_size, info.st_mtime_ns, info.st_ctime_ns) and refused[3] > time.time() and refused[4] == VERSION:
+                    continue
+                _validate(limits)
+                with _decoded(source, path.name.endswith('.zst'), limits) as handle:
                     with spool._transaction():
-                        if reset_occurrences:
-                            spool._db.execute('DELETE FROM harness_occurrences WHERE identity=?', (key,))
-                        for parsed in records:
-                            message = parsed.message
-                            if 'NATIVE_ID_DERIVED' in message.warnings:
-                                occurrence = spool._db.execute('INSERT INTO harness_occurrences VALUES(?,?,1) '
-                                    'ON CONFLICT(identity,native) DO UPDATE SET occurrence=occurrence+1 '
-                                    'RETURNING occurrence', (key, message.native_id)).fetchone()[0]
-                                message = replace(message, native_id=message.native_id + ':occurrence:' + str(occurrence))
-                                parsed = replace(parsed, message=message)
-                            seq_row = spool._db.execute('SELECT seq FROM harness_ids WHERE session=? AND native=?',
-                                (message.native_session_id, message.native_id)).fetchone()
-                            if seq_row:
-                                seq = seq_row[0]
+                        spool._db.execute('DELETE FROM harness_refusals WHERE identity=?', (key.removeprefix('live:'),))
+                    position, context, digest = 0, {}, hashlib.sha256()
+                    if previous:
+                        position, expected, serialized = previous[:3]
+                        digest = _prefix(handle, position)
+                        if digest is None or digest.hexdigest() != expected:
+                            position, context, digest = 0, {}, hashlib.sha256()
+                            result['resets'] += 1
+                        else:
+                            context = json.loads(serialized)
+                    handle.seek(position)
+                    reset_occurrences = position == 0
+                    result['files'] += 1
+                    while result['lines'] < max_lines:
+                        start = handle.tell()
+                        line = handle.readline(min(limits.max_archive_member_bytes, 32 * 1024 * 1024) + 1)
+                        if not line:
+                            break
+                        oversize = len(line) > min(limits.max_archive_member_bytes, 32 * 1024 * 1024)
+                        sample = line[:65536]
+                        row_hash = hashlib.sha256(line)
+                        digest.update(line)
+                        while line and not line.endswith(b'\n') and oversize:
+                            line = handle.readline(65536)
+                            row_hash.update(line)
+                            digest.update(line)
+                        if not line.endswith(b'\n'):
+                            # Do not consume incomplete/oversize partial records.
+                            break
+                        end = handle.tell()
+                        records, cause, updated = [], None, context
+                        record_type = 'invalid_json'
+                        example = {'type': 'unparsed', 'bytes': end-start}
+                        limit_bytes = None
+                        try:
+                            if oversize:
+                                # The full frame is drained/hash-counted, never retained.
+                                match = re.search(rb'"type"\s*:\s*"([A-Za-z_][A-Za-z0-9_.-]{0,63})"', sample)
+                                record_type = match[1].decode() if match else 'oversize_record'
+                                limit_bytes = min(limits.max_archive_member_bytes, 32*1024*1024)
+                                raise SkipRecord('SOURCE_RECORD_SIZE_LIMIT')
+                            raw, warnings = _json(line)
+                            if warnings:
+                                raise SkipRecord('JSON_INVALID')
+                            record_type = record_name(raw)
+                            records, updated, cause = project(raw, source=identity, path=path,
+                                context=context, limits=limits, attachment_roots=attachment_roots)
+                            # Validate the exact wire boundary before durable admission.
+                            for parsed in records:
+                                decode_record(encode_record(parsed))
+                                # Preflight the existing upload-envelope bound too;
+                                # a too-large raw frame belongs in the skip ledger,
+                                # never in a queue that can permanently block later rows.
+                                try:
+                                    spool._prepare(parsed)
+                                except ClientError as error:
+                                    if error.code not in ('REQUEST_TOO_LARGE', 'INVALID_REQUEST'):
+                                        raise
+                                    raise SkipRecord('UPLOAD_ENVELOPE_OVERSIZE') from None
+                        except (HarnessRejected, SkipRecord, RequestError, UnicodeError, TypeError, KeyError, RecursionError) as error:
+                            records, updated = [], context
+                            cause = refusal_code(error) if isinstance(error, HarnessRejected) else str(error) if isinstance(error, SkipRecord) else 'RECORD_INVALID'
+                        # Per-row transaction includes all fragments. Queue full rolls
+                        # back IDs/seen/cursor together, leaving the record retryable.
+                        with spool._transaction():
+                            if reset_occurrences:
+                                spool._db.execute('DELETE FROM harness_occurrences WHERE identity=?', (key,))
+                            for parsed in records:
+                                message = parsed.message
+                                if 'NATIVE_ID_DERIVED' in message.warnings:
+                                    occurrence = spool._db.execute('INSERT INTO harness_occurrences VALUES(?,?,1) '
+                                        'ON CONFLICT(identity,native) DO UPDATE SET occurrence=occurrence+1 '
+                                        'RETURNING occurrence', (key, message.native_id)).fetchone()[0]
+                                    message = replace(message, native_id=message.native_id + ':occurrence:' + str(occurrence))
+                                    parsed = replace(parsed, message=message)
+                                seq_row = spool._db.execute('SELECT seq FROM harness_ids WHERE session=? AND native=?',
+                                    (message.native_session_id, message.native_id)).fetchone()
+                                if seq_row:
+                                    seq = seq_row[0]
+                                else:
+                                    seq = spool._db.execute('SELECT coalesce(max(seq),-1)+1 FROM harness_ids WHERE session=?',
+                                        (message.native_session_id,)).fetchone()[0]
+                                    spool._db.execute('INSERT INTO harness_ids VALUES(?,?,?)',
+                                        (message.native_session_id, message.native_id, seq))
+                                parsed = replace(parsed, message=replace(message, seq=seq))
+                                try:
+                                    prepared = spool._prepare(parsed)
+                                except ClientError as error:
+                                    if error.code not in ('REQUEST_TOO_LARGE', 'INVALID_REQUEST'):
+                                        raise
+                                    # Whole multi-fragment row must remain retryable,
+                                    # not partially admitted. Surface explicitly.
+                                    raise ClientError('HARNESS_RECORD_TOO_LARGE') from None
+                                version = (message.native_session_id, message.native_id, prepared[1])
+                                # Latest-only seen fingerprints cannot recognize an
+                                # older revision on a full replay after rotation.
+                                promote = getattr(spool, 'promote', None)
+                                if promote is not None:
+                                    promote(message.native_session_id, message.native_id)
+                                if spool._db.execute('SELECT 1 FROM harness_versions '
+                                    'WHERE session=? AND native=? AND fingerprint=?', version).fetchone():
+                                    continue
+                                if spool._add_prepared(prepared):
+                                    result['admitted'] += 1
+                                spool._db.execute('INSERT INTO harness_versions VALUES(?,?,?)', version)
+                            if records:
+                                for record in records:
+                                    meta = json.loads(record.message.native_source)
+                                    store_session(spool, session_payload(updated, spool.source, path, session=record.message.native_session_id,
+                                                  kind=meta.get('kind'), parent=meta.get('parent')))
                             else:
-                                seq = spool._db.execute('SELECT coalesce(max(seq),-1)+1 FROM harness_ids WHERE session=?',
-                                    (message.native_session_id,)).fetchone()[0]
-                                spool._db.execute('INSERT INTO harness_ids VALUES(?,?,?)',
-                                    (message.native_session_id, message.native_id, seq))
-                            parsed = replace(parsed, message=replace(message, seq=seq))
-                            try:
-                                prepared = spool._prepare(parsed)
-                            except ClientError as error:
-                                if error.code not in ('REQUEST_TOO_LARGE', 'INVALID_REQUEST'):
-                                    raise
-                                # Whole multi-fragment row must remain retryable,
-                                # not partially admitted. Surface explicitly.
-                                raise ClientError('HARNESS_RECORD_TOO_LARGE') from None
-                            version = (message.native_session_id, message.native_id, prepared[1])
-                            # Latest-only seen fingerprints cannot recognize an
-                            # older revision on a full replay after rotation.
-                            promote = getattr(spool, 'promote', None)
-                            if promote is not None:
-                                promote(message.native_session_id, message.native_id)
-                            if spool._db.execute('SELECT 1 FROM harness_versions '
-                                'WHERE session=? AND native=? AND fingerprint=?', version).fetchone():
-                                continue
-                            if spool._add_prepared(prepared):
-                                result['admitted'] += 1
-                            spool._db.execute('INSERT INTO harness_versions VALUES(?,?,?)', version)
-                        if records:
-                            for record in records:
-                                meta = json.loads(record.message.native_source)
-                                store_session(spool, session_payload(updated, spool.source, path, session=record.message.native_session_id,
-                                              kind=meta.get('kind'), parent=meta.get('parent')))
-                        else:
-                            store_session(spool, session_payload(updated, spool.source, path))
-                        skip_key = key.removeprefix('live:')
-                        if cause:
-                            spool._db.execute('INSERT OR REPLACE INTO harness_skips VALUES(?,?,?,?,?)',
-                                (skip_key, start, row_hash.hexdigest(), cause, record_type))
-                            result['skipped'] += 1
-                        else:
-                            spool._db.execute('DELETE FROM harness_skips WHERE identity=? AND position=?', (skip_key, start))
-                        # Do not mark the file unchanged until we reached EOF.
-                        done = end == handle.seek(0, os.SEEK_END)
-                        handle.seek(end)
-                        spool._db.execute('INSERT OR REPLACE INTO harness_files VALUES(?,?,?,?,?,?,?,?)',
-                            (key, str(path), end, digest.hexdigest(), json.dumps(updated),
-                             info.st_size if done else -1, info.st_mtime_ns, info.st_ctime_ns))
-                    context = updated
-                    reset_occurrences = False
-                    result['lines'] += 1
+                                store_session(spool, session_payload(updated, spool.source, path))
+                            skip_key = key.removeprefix('live:')
+                            if cause:
+                                if not oversize and record_type != 'invalid_json':
+                                    example = shape(raw)
+                                spool._db.execute('INSERT OR REPLACE INTO harness_skips(identity,position,digest,cause,record_type,bytes,limit_bytes,shape) VALUES(?,?,?,?,?,?,?,?)',
+                                    (skip_key, start, row_hash.hexdigest(), cause, record_type, end-start, limit_bytes, json.dumps(example)))
+                                result['skipped'] += 1
+                            else:
+                                spool._db.execute('DELETE FROM harness_skips WHERE identity=? AND position=?', (skip_key, start))
+                            # Do not mark the file unchanged until we reached EOF.
+                            done = end == handle.seek(0, os.SEEK_END)
+                            handle.seek(end)
+                            spool._db.execute('INSERT OR REPLACE INTO harness_files VALUES(?,?,?,?,?,?,?,?)',
+                                (key, str(path), end, digest.hexdigest(), json.dumps(updated),
+                                 info.st_size if done else -1, info.st_mtime_ns, info.st_ctime_ns))
+                        context = updated
+                        reset_occurrences = False
+                        result['lines'] += 1
+        except HarnessRejected as error:
+            result['refused_files'] += 1
+            with spool._transaction():
+                spool._db.execute('INSERT OR REPLACE INTO harness_refusals VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                    (key.removeprefix('live:'), str(path), refusal_code(error), info.st_size,
+                     error.limit, error.size, json.dumps({'type': 'unreadable', 'bytes': info.st_size}),
+                     info.st_mtime_ns, info.st_ctime_ns, time.time()+300, VERSION))
     return result

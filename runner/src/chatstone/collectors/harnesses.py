@@ -37,6 +37,10 @@ from .policy import SourceDenied, checked_path, open_explicit
 class HarnessRejected(ValueError):
     """Coded input, identity or decompression failure; no contents in errors."""
 
+    def __init__(self, code, *, size=None, limit=None):
+        super().__init__(code)
+        self.code, self.size, self.limit = code, size, limit
+
 
 def _validate(limits):
     for value in (limits.max_text_bytes, limits.max_attachment_bytes,
@@ -51,7 +55,7 @@ def _chunks(handle, cap):
     while chunk := handle.read(min(65_536, cap - count + 1)):
         count += len(chunk)
         if count > cap:
-            raise HarnessRejected("SOURCE_SIZE_LIMIT")
+            raise HarnessRejected("SOURCE_SIZE_LIMIT", size=count, limit=cap)
         yield chunk
 
 
@@ -166,7 +170,7 @@ def _zstd_chunks(chunks, cap):
                     raise HarnessRejected("ZSTD_INVALID")
                 count += outgoing.pos
                 if count > cap:
-                    raise HarnessRejected("SOURCE_SIZE_LIMIT")
+                    raise HarnessRejected("SOURCE_SIZE_LIMIT", size=count, limit=cap)
                 if outgoing.pos:
                     yield target.raw[:outgoing.pos]
                 if incoming.pos == incoming.size and (hint == 0 or outgoing.pos < outgoing.size):

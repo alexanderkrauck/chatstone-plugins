@@ -98,7 +98,7 @@ jobs:
             test "$(cat draft-state)" = true
             gh release edit "$release" --target "$GITHUB_SHA"
           else
-            gh release create "$release" --draft --target "$GITHUB_SHA" --title "$release candidate" --notes 'Native candidate only. The owner must approve and publish the stamped marketplace.'
+            gh release create "$release" --draft --target "$GITHUB_SHA" --title "$release" --notes 'Native candidate only. The owner must approve and publish the stamped marketplace.'
           fi
           gh release upload "$release" assets/* --clobber
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

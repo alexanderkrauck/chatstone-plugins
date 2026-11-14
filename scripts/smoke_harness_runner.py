@@ -66,6 +66,22 @@ def main():
         result = subprocess.run([str(binary), 'parse', '--source', 'codex', str(archived)],
                                 check=True, capture_output=True, text=True)
         assert json.loads(result.stdout)['admitted'] == 3
+        refused = temp/'rollout-REFUSED.jsonl.zst'
+        refused.write_bytes(b'not valid zstd')
+        result = subprocess.run([str(binary), 'parse', '--source', 'codex', str(refused)],
+                                check=True, capture_output=True, text=True)
+        assert json.loads(result.stdout)['refused_files'] == 1
+        oversized = temp/'SYNTHETIC-oversized.jsonl'
+        with oversized.open('wb') as handle:
+            handle.write(b'{"type":"user","message":{"role":"user","content":"')
+            for _ in range(40):
+                handle.write(b'x'*(1024*1024))
+            handle.write(b'"}}\n')
+            handle.write(fixture.read_bytes())
+        result = subprocess.run([str(binary), 'parse', '--source', 'claude_code', str(oversized)],
+                                check=True, capture_output=True, text=True)
+        counts = json.loads(result.stdout)
+        assert counts['admitted'] == 3 and counts['skipped'] == 1
         cert = temp/'cert.pem'
         key = temp/'key.pem'
         config = temp/'cert.cnf'

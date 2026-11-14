@@ -25,6 +25,8 @@ from uuid import uuid4
 
 import httpx
 
+from chatstone.collectors.harnesses import HarnessRejected
+
 from .harness_capture import capture, discover, prepare, retry_skipped
 from .ingest import IngestClient, encode_ingest_json
 from .native_product import ORIGIN, PRODUCT, VERSION
@@ -551,6 +553,20 @@ def snapshot(spool):
     value = spool.status()
     value['skips'] = dict(spool._db.execute('SELECT cause,count(*) FROM harness_skips GROUP BY cause'))
     value['skipped_types'] = dict(spool._db.execute('SELECT record_type,count(*) FROM harness_skips GROUP BY record_type'))
+    value['refused_files'] = {'count': 0, 'reasons': {}}
+    for code, count, size, observed, limit in spool._db.execute(
+            'SELECT cause,count(*),max(bytes),max(observed_bytes),max(limit_bytes) FROM harness_refusals GROUP BY cause'):
+        value['refused_files']['count'] += count
+        value['refused_files']['reasons'][code] = {'count': count, 'largest_bytes': size,
+                                                'observed_bytes': observed, 'limit_bytes': limit}
+    value['too_large'] = {'count': 0, 'sizes': [], 'reasons': dict(spool._db.execute(
+        "SELECT cause,count(*) FROM harness_skips WHERE cause IN ('UPLOAD_ENVELOPE_OVERSIZE',"
+        "'RAW_ORIGINAL_OVERSIZE','SOURCE_RECORD_SIZE_LIMIT') GROUP BY cause"))}
+    for size, in spool._db.execute("SELECT bytes FROM harness_skips WHERE cause IN "
+            "('UPLOAD_ENVELOPE_OVERSIZE','RAW_ORIGINAL_OVERSIZE','SOURCE_RECORD_SIZE_LIMIT') ORDER BY bytes DESC"):
+        value['too_large']['count'] += 1
+        if len(value['too_large']['sizes']) < 8:
+            value['too_large']['sizes'].append(size)
     value['found'] = spool._db.execute('SELECT count(*) FROM harness_ids').fetchone()[0]
     value['files'] = spool._db.execute('SELECT count(DISTINCT path) FROM harness_files').fetchone()[0]
     waiting = spool._db.execute('SELECT count(DISTINCT i.native) FROM native_identity i JOIN pending p ON i.batch=p.batch').fetchone()[0]
@@ -622,7 +638,7 @@ def wake(source, *, hook=False, importing=False):
 
 
 def cause(error):
-    code = error.code if isinstance(error, ClientError) else type(error).__name__.upper()
+    code = error.code if isinstance(error, (ClientError, HarnessRejected)) else type(error).__name__.upper()
     if code == 'SPOOL_IO':
         detail = getattr(error.__context__, 'sqlite_errorname', '')
         if re.fullmatch(r'SQLITE_[A-Z_]{1,64}', detail):
@@ -710,15 +726,26 @@ def run_steps(config, args):
                 value = step(config, history=args.action == 'backfill', client=client)
             failures = 0
         except Exception as error:
-            if not transient(error):
-                raise
             code = cause(error)
             if args.action == 'diagnose':
                 value = status(config)
-                print(json.dumps(value, sort_keys=True) if args.json else 'Sync probe interrupted ('+code+'); queued messages are safe.')
+                value['probe_cause'] = code
+                try:
+                    value['examples'] = diagnostics(config)
+                except ClientError as busy:
+                    if busy.code not in ('SPOOL_BUSY', 'SYNC_BUSY'):
+                        raise
+                    value['examples_unavailable'] = 'upload in progress; run diagnose after this upload'
+                print(json.dumps(value, sort_keys=True) if args.json else 'Sync probe interrupted: '+reason(code)+'; queued messages are safe.')
                 if not args.json:
                     print_status(value)
+                    if 'examples' in value:
+                        print_diagnostics(value['examples'])
+                    elif 'examples_unavailable' in value:
+                        print(value['examples_unavailable'])
                 return 1
+            if not transient(error):
+                raise
             if code in ('SYNC_BUSY', 'SPOOL_BUSY', 'SPOOL_IO:SQLITE_BUSY', 'SPOOL_IO:SQLITE_LOCKED'):
                 # Local contention is neither an upload attempt nor a connection failure.
                 time.sleep(.05)
@@ -732,13 +759,15 @@ def run_steps(config, args):
             time.sleep(min(3600, 30*2**min(failures-1, 7)))
             continue
         count += 1
+        if args.action == 'diagnose':
+            value['examples'] = diagnostics(config)
         if args.action != 'sync' or args.foreground:
             print(json.dumps(value, sort_keys=True) if args.json else
                   f"{args.source}: {value['admitted']} found, {value['delivered']} uploaded, "
                   f"{value['pending']} waiting; {sum(value['skips'].values())} skipped.", flush=True)
         if args.action == 'diagnose' or (args.action == 'backfill' and args.steps and count >= args.steps):
             break
-        idle = idle+1 if not value['lines'] and not value['pending'] and not value.get('metadata_more') and not value.get('deferred') else 0
+        idle = idle+1 if not value['lines'] and not value['pending'] and not value.get('metadata_more') and not value.get('deferred') and not value['refused_files']['count'] else 0
         if until:
             try:
                 until = max(until, private_read(folder('data')/(args.source+'.hook')).get('at', 0)-time.time()+time.monotonic()+30)
@@ -746,7 +775,7 @@ def run_steps(config, args):
                 pass
         if idle and (not until or time.monotonic() >= until):
             break
-        pause = .5 if idle else .05
+        pause = 5 if not value['lines'] and not value['delivered'] and value['refused_files']['count'] else .5 if idle else .05
         if not value['lines'] and not value['delivered'] and value.get('next_retry'):
             # Poll for newly flushed/live rows while parked uploads sleep; the
             # durable per-item deadline prevents hooks/process restarts bypassing it.
@@ -755,6 +784,8 @@ def run_steps(config, args):
     if not args.json and (args.action != 'sync' or args.foreground):
         print(f"Import summary: {value['found']} found, {value['uploaded']} uploaded, {value['pending']} waiting, {sum(value['skips'].values())} skipped.")
         print_status(status(config))
+        if args.action == 'diagnose':
+            print_diagnostics(value['examples'])
     return 0
 
 
@@ -858,24 +889,78 @@ def hook_stamp(hook):
     return hook.get('event', 'unknown')+' '+stamp(hook['at']) if hook.get('at') else 'never'
 
 
+def reason(code) -> str:
+    return {
+        'SOURCE_SIZE_LIMIT': 'decoded session exceeds the file limit',
+        'SOURCE_RECORD_LIMIT': 'session exceeds the record count limit',
+        'SOURCE_RECORD_SIZE_LIMIT': 'record exceeds the size limit',
+        'ZSTD_INVALID': 'invalid or incomplete compressed data (or unsupported decoder window)',
+        'ZSTD_UNAVAILABLE': 'compressed-session decoder is unavailable; update the plugin',
+        'LIMIT_INVALID': 'reader limits are invalid; update the plugin',
+        'NATIVE_ID_RESERVED': 'record uses a reserved message identifier',
+        'NATIVE_SESSION_ID_RESERVED': 'record uses a reserved session identifier',
+        'UPLOAD_ENVELOPE_OVERSIZE': 'message exceeds the 2 MiB upload request limit',
+        'RAW_ORIGINAL_OVERSIZE': 'original record exceeds the 25,000,000-byte file part limit',
+        'UPLOAD_BODY_TIMEOUT': 'too large for this connection within 120 seconds',
+        'SERVICE_UNAVAILABLE': 'server temporarily unavailable',
+        'TRANSPORT_ERROR': 'connection interrupted',
+        'HARNESSREJECTED': 'the previous reader refused an item; see diagnose',
+    }.get(code, code.lower().replace('_', ' '))
+
+
+def diagnostics(config):
+    # Never read SQLite concurrently with its writer. Normal status stays lock-free.
+    with lease(config['source']), open_spool(config) as spool:
+        prepare(spool)
+        skipped = {}
+        for name, cause, size, example in spool._db.execute(
+                'SELECT record_type,cause,bytes,shape FROM harness_skips ORDER BY record_type,bytes DESC'):
+            if name not in skipped:
+                skipped[name] = {'cause': cause, 'bytes': size, 'shape': json.loads(example)}
+        refused = [{'cause': code, 'bytes': size, 'observed_bytes': observed, 'limit_bytes': limit,
+                    'shape': json.loads(example)} for code, size, observed, limit, example in spool._db.execute(
+                    'SELECT cause,bytes,observed_bytes,limit_bytes,shape FROM harness_refusals ORDER BY identity')]
+        return {'skipped_record_types': skipped, 'refused_files': refused}
+
+
+def print_diagnostics(examples):
+    for name, example in examples['skipped_record_types'].items():
+        print('Skipped '+name+': '+json.dumps(example, sort_keys=True, separators=(',', ':')))
+    for number, example in enumerate(examples['refused_files'], 1):
+        print('Refused file '+str(number)+': '+json.dumps(example, sort_keys=True, separators=(',', ':')))
+
+
 def print_status(value):
     if value.get('snapshot_pending'):
         print(value['source']+' '+value['version']+': preparing queue summary; queued messages are safe.')
         return
-    success, failure = value.get('last_success', value['upload']), value.get('last_failure', value['error'])
+    success = value.get('last_success', value.get('upload', {}))
+    failure = value.get('last_failure', value.get('error', {}))
+    print(f"{value['source']} {value['version']}: {value['found']} found, {value['uploaded']} uploaded, {value['pending']} waiting.")
+    issues = []
+    refused = value.get('refused_files', {})
+    for code, info in sorted(refused.get('reasons', {}).items()):
+        n = info['count']
+        detail = str(info['largest_bytes'])+' bytes on disk'
+        if info.get('observed_bytes') is not None:
+            detail += ', at least '+str(info['observed_bytes'])+' decoded bytes'
+        if info.get('limit_bytes') is not None:
+            detail += ', limit '+str(info['limit_bytes'])+' bytes'
+        issues.append(str(n)+' session file'+('s' if n != 1 else '')+' set aside: '+reason(code)+' ('+detail+'); retry automatically in 5 minutes or after an update')
     aside = value.get('set_aside', {})
-    print(f"{value['source']} {value['version']}: {value['found']} found, {value['uploaded']} uploaded, "
-          f"{value['pending']} waiting; {aside.get('count', 0)} set aside; last hook {hook_stamp(value['hook'])}.")
-    print('Last successful upload: '+stamp(success.get('at'))+'; last failed upload: '+
-          stamp(failure.get('at'))+(' ('+failure.get('cause', 'unknown')+')' if failure else '')+'.')
     if aside.get('count'):
-        labels = {'UPLOAD_BODY_TIMEOUT': 'UPLOAD_BODY_TIMEOUT (too large for this connection)'}
-        reasons = ', '.join(labels.get(k, k)+'='+str(n) for k, n in sorted(aside['reasons'].items()))
-        print(f"Set aside: {reasons}; largest {aside['largest_bytes']} bytes; "
-              f"up to {aside['max_attempts']} attempts; retry automatically after {stamp(value.get('next_retry'))}.")
-    if value['skips'] or value['skipped_types']:
-        print('Skipped record types: '+(', '.join(k+'='+str(n) for k, n in sorted(value['skipped_types'].items())) or 'none')+
-              '; reasons: '+(', '.join(k+'='+str(n) for k, n in sorted(value['skips'].items())) or 'none'))
+        issues.append(str(aside['count'])+' upload'+('s' if aside['count'] != 1 else '')+' set aside: '+
+            ', '.join(reason(k)+' ('+str(n)+')' for k, n in sorted(aside['reasons'].items()))+
+            '; largest '+str(aside['largest_bytes'])+' bytes; retry automatically')
+    large = value.get('too_large', {})
+    if large.get('count'):
+        issues.append(str(large['count'])+' message'+('s' if large['count'] != 1 else '')+' too large to upload ('+
+            ', '.join(str(s)+' bytes' for s in large['sizes'])+
+            ('; more in diagnose' if large['count'] > len(large['sizes']) else '')+'); '+', '.join(reason(k) for k in large.get('reasons', {}))+'; originals remain in the harness')
+    if issues:
+        print('; '.join(issues)+'.')
+    print('Last upload: '+stamp(success.get('at'))+
+          ('; last failure: '+reason(failure.get('cause', 'UNKNOWN'))+' at '+stamp(failure.get('at')) if failure and failure.get('at', 0) >= success.get('at', 0) else '')+'.')
 
 
 def main(argv=None):
