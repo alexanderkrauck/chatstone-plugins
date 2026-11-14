@@ -6,8 +6,11 @@ needed. Requires a supported native harness, POSIX sh, curl and stock OS utiliti
 (including SHA-256). Linux and macOS only; Windows is not supported. The release
 workflow targets Ubuntu 24.04 for Linux; older distributions are unqualified.
 
-**Build candidate:** this repository becomes installable only after all four
-native jobs pass and an operator publishes the stamped marketplace and release.
+**Published artifacts:** [v0.2.3](https://github.com/alexanderkrauck/chatstone-plugins/releases/tag/v0.2.3)
+is available for the supported Linux and macOS platforms. Hosted enrollment
+remains invitation-only. Read the release notes for qualification limits; the
+macOS binaries are ad-hoc signed, not notarized.
+
 Do not install an unstamped candidate (its empty hashes intentionally refuse downloads).
 
 ## Install
