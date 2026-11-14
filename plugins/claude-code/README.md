@@ -62,12 +62,21 @@ Live session tails overtake historical queues, including partially read files.
 Hooks also fire on user-prompt submission and tool completion; workers keep
 checking for delayed transcript writes for 30 seconds after the latest hook.
 Imports retry timeouts, disconnects and server restarts automatically with
-backoff. Invalid/revoked keys, disabled ingestion and exhausted capacity stop
+backoff. A failed original stays with its whole message and batch ID, never
+uploads as a silently missing attachment, and does not block unrelated messages.
+Retries wait 30/60 seconds; after failure 3 the item is shown as set aside and
+waits 5 minutes, then 10/20/40/60 minutes (one-hour cap). The background importer
+retries on its own; no new login or command. Later revisions of that same native
+message wait behind it; other messages retain live/history priority.
+Upload time scales with body size: 1 Mbit/s plus 50% margin and 15 seconds setup,
+capped at 300 seconds. Read-tool timeouts are unchanged.
+Invalid/revoked keys, disabled ingestion and exhausted capacity stop
 with an explanation and a next step. Queued records remain safe.
 
 Default output is plain progress and a final summary; `--json` preserves the
 machine-readable form. `status` without `--source` shows both sources, last
-hook/last successful upload and skipped record **type names** with counts. New
+hook, last successful/failed upload and reason, plus set-aside count, reasons,
+largest bytes and attempts. Skipped record **type names** have counts. New
 parsers automatically re-read old skips and enrich session metadata without
 resending unchanged messages. `diagnose` runs one bounded real probe.
 
@@ -96,17 +105,17 @@ included or qualified here.
 
 ## Update and remove
 
-Close both harnesses before updating the shared runner (an old 0.2.0 launcher
+Close both harnesses before updating the shared runner (an older launcher
 would otherwise reinstall its old pin). In a terminal:
 
 ```sh
 claude plugin marketplace update chatstone
 claude plugin update chatstone@chatstone --scope user
-sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/chatstone/chatstone/0.2.1/launcher.sh" --version
+sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/chatstone/chatstone/0.2.2/launcher.sh" --version
 codex plugin marketplace upgrade chatstone
 codex plugin remove chatstone@chatstone
 codex plugin add chatstone@chatstone
-sh "${CODEX_HOME:-$HOME/.codex}/plugins/cache/chatstone/chatstone/0.2.1/launcher.sh" --version
+sh "${CODEX_HOME:-$HOME/.codex}/plugins/cache/chatstone/chatstone/0.2.2/launcher.sh" --version
 ```
 
 Each launcher verifies its exact pin before atomic replacement and resumes
