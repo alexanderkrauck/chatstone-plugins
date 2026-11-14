@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -17,7 +18,7 @@ import tempfile
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -94,6 +95,9 @@ class NativeSpool(Spool):
 
     def status(self):
         value = super().status()
+        if not self._db.execute("SELECT 1 FROM sqlite_master WHERE name='native_retry'").fetchone():
+            return {**value, 'set_aside': {'count': 0, 'largest_bytes': 0, 'max_attempts': 0, 'reasons': {}},
+                    'last_success': {}, 'last_failure': {}, 'active_pending': value['pending'], 'next_retry': None}
         count, largest, attempts = self._db.execute(
             "SELECT count(*),coalesce(max(bytes),0),coalesce(max(attempts),0) FROM native_retry "
             "WHERE attempts>=3 AND code!='AWAITING_RECEIPT'").fetchone()
@@ -531,11 +535,50 @@ def snapshot(spool):
     return value
 
 
+def read_snapshot(config):
+    # Uploaders retain their process lock across sockets, but SQLite transactions
+    # are short. Inspect a consistent read-only snapshot without taking that lock;
+    # do not use immutable=1, which could expose uncommitted rollback-journal pages.
+    path = folder('data')/(config['source']+'.sqlite')
+    if not path.exists():
+        with open_spool(config) as spool:
+            prepare(spool)
+    for ancestor in (*reversed(path.parents), path):
+        if ancestor.is_symlink():
+            raise ClientError('SPOOL_UNSAFE')
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise ClientError('SPOOL_UNSAFE')
+    for item in path.iterdir():
+        if item.name not in ('.lock', 'spool.sqlite3', 'spool.sqlite3-journal'):
+            raise ClientError('SPOOL_UNSAFE')
+        try:
+            Spool._check_file(item.lstat())
+        except FileNotFoundError:
+            if item.name != 'spool.sqlite3-journal':
+                raise ClientError('SPOOL_BUSY') from None
+    try:
+        with closing(sqlite3.connect((path/'spool.sqlite3').as_uri()+'?mode=ro', uri=True, timeout=1)) as db:
+            db.execute('PRAGMA trusted_schema=OFF')
+            db.execute('PRAGMA query_only=ON')
+            db.execute('BEGIN')
+            row = db.execute('SELECT source,host,destination,version FROM identity WHERE id=1').fetchone()
+            if row != (config['source'], config['device'], config['origin'].rstrip('/'), 2):
+                raise ClientError('SPOOL_IDENTITY_MISMATCH')
+            # Reuse the identical content-free queries, without opening/migrating
+            # a writer or making the status path an alternative queue owner.
+            view = object.__new__(NativeSpool)
+            view._db = db
+            value = snapshot(view)
+            value['files'] = db.execute('SELECT count(DISTINCT path) FROM harness_files').fetchone()[0]
+            return value
+    except sqlite3.OperationalError as error:
+        raise ClientError('SPOOL_BUSY' if error.sqlite_errorcode in (5, 6) else 'SPOOL_CORRUPT') from None
+
+
 def status(config):
-    with open_spool(config) as spool:
-        prepare(spool)
-        value = snapshot(spool)
-        value['files'] = spool._db.execute('SELECT count(DISTINCT path) FROM harness_files').fetchone()[0]
+    value = read_snapshot(config)
     try:
         value['last'] = private_read(folder('data') / (config['source'] + '.status'))
     except ClientError:
@@ -835,7 +878,7 @@ def main(argv=None):
                         value = status(load(source))
                         break
                     except ClientError as error:
-                        if error.code != 'SYNC_BUSY':
+                        if error.code not in ('SYNC_BUSY', 'SPOOL_BUSY'):
                             raise
                         time.sleep(.1)
                 values.append(value)
