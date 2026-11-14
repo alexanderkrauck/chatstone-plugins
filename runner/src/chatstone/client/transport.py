@@ -144,8 +144,8 @@ class Client:
             raise ClientError('INVALID_OPERATION')
         return self._request('/api/v1/' + operation, encode_json(kwargs))
 
-    def _request(self, path, body, *, media='application/json', deadline=None):
-        end = min(deadline or float('inf'), monotonic() + self.timeout)
+    def _request(self, path, body, *, media='application/json', deadline=None, timeout=None):
+        end = min(deadline or float('inf'), monotonic() + (self.timeout if timeout is None else timeout))
         try:
             token = self._secret_getter()
             if not isinstance(token, str) or not TOKEN.fullmatch(token):

@@ -111,6 +111,18 @@ class IngestClient(Client):
     key_environment = 'CHATSTONE_INGEST_KEY'
     ordered = False  # Explicit orchestration opt-in after server upgrade.
 
+    def _request(self, path, body, *, media='application/json', deadline=None, timeout=None):
+        if not path.startswith('/api/v1/ingest/'):
+            return super()._request(path, body, media=media, deadline=deadline, timeout=timeout)
+        # 1 Mbit/s (125,000 bytes/s), 50% transmission margin + 15s setup.
+        # Read APIs retain their own timeout. Explicit aggregate deadlines win.
+        allowance = min(300, max(self.timeout, 15 + len(body) * 1.5 / 125_000))
+        try:
+            return super()._request(path, body, media=media, deadline=deadline, timeout=allowance)
+        except ClientError as error:
+            error.upload_bytes = len(body)
+            raise
+
     def register_source(self, *, install_id, source, host, deadline=None):
         return self._request('/api/v1/ingest/sources', encode_json({
             'install_id': identity(install_id), 'source': source, 'host': host}), deadline=deadline)

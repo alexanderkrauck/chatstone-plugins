@@ -135,7 +135,7 @@ def main():
             with socket.socket() as unavailable:
                 unavailable.bind(('127.0.0.1', 0))
                 unavailable.listen(1)
-                unavailable.settimeout(10)
+                unavailable.settimeout(60)
                 accepted = []
                 def refuse_http():
                     with unavailable.accept()[0] as connection:
@@ -171,7 +171,7 @@ def main():
                 actual_status = json.loads(status_file.read_text())
                 assert actual_status['cause'] == 'TRANSPORT_ERROR' and type(actual_status['at']) is int, actual_status
                 success_file = status_file.with_suffix('.status')
-                deadline = time.monotonic()+15
+                deadline = time.monotonic()+45
                 while not success_file.exists() and time.monotonic() < deadline:
                     time.sleep(.1)
                 assert success_file.exists(), 'DETACHED_WORKER_DID_NOT_RETRY'
