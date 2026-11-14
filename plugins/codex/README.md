@@ -78,12 +78,23 @@ receipt commits can require one repeat per ambiguous event.
 Invalid/revoked keys, disabled ingestion and exhausted capacity stop
 with an explanation and a next step. Queued records remain safe.
 
-Default output is plain progress and a final summary; `--json` preserves the
-machine-readable form. `status` without `--source` shows both sources, last
-hook, last successful/failed upload and reason, plus set-aside count, reasons,
-largest bytes and attempts. Skipped record **type names** have counts. New
-parsers automatically re-read old skips and enrich session metadata without
-resending unchanged messages. `diagnose` runs one bounded real probe.
+Default `status` is at most three lines per source: found/uploaded/waiting,
+anything set aside or too large with its reason and size, and the last upload.
+Bookkeeping counts, last hook, failures and retry details remain in `status
+--json`. `diagnose` runs one bounded probe and shows one content-free example
+per skipped record type and refused file: key names, value types and byte sizes,
+never field values or paths. New versions automatically re-read old skips and
+enrich session metadata without resending unchanged messages.
+
+A refused session file cannot stop the source: other files and already-queued
+messages continue. Refused compressed files retry every five minutes, when
+changed, and after an update. Native plain JSONL has no lifetime size/record
+count limit. Compressed snapshots allow up to4GiB decoded (formerly250MB);
+native rows remain capped at32MiB, original file parts at25,000,000bytes and
+JSON upload requests at2MiB. Oversized text envelopes remain in the harness;
+status gives their counts and original record sizes. Workflow journal result
+values are captured, while recognized start/failure/launch lifecycle records
+are classified as bookkeeping.
 
 A short `chatstone` link is created only in an existing, safe user directory
 already on PATH. No shell profile is edited; otherwise printed hints contain
@@ -116,11 +127,11 @@ would otherwise reinstall its old pin). In a terminal:
 ```sh
 claude plugin marketplace update chatstone
 claude plugin update chatstone@chatstone --scope user
-sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/chatstone/chatstone/0.2.2/launcher.sh" --version
+sh "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/chatstone/chatstone/0.2.3/launcher.sh" --version
 codex plugin marketplace upgrade chatstone
 codex plugin remove chatstone@chatstone
 codex plugin add chatstone@chatstone
-sh "${CODEX_HOME:-$HOME/.codex}/plugins/cache/chatstone/chatstone/0.2.2/launcher.sh" --version
+sh "${CODEX_HOME:-$HOME/.codex}/plugins/cache/chatstone/chatstone/0.2.3/launcher.sh" --version
 ```
 
 Each launcher verifies its exact pin before atomic replacement and resumes
